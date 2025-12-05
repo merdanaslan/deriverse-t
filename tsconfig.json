@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "noEmit": true,
+    "types": ["node"],
+    "noEmitOnError": false
+  },
+  "ts-node": {
+    "esm": false,
+    "compilerOptions": {
+      "skipLibCheck": true,
+      "strict": false
+    }
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "dist", "OLD_README.md"]
+}
