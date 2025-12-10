@@ -46,8 +46,6 @@ We rely on specific components from the `@deriverse/kit` SDK to interpret the bl
 #### 2. Event Models (Classes)
 These are the specific class instances returned by `logsDecode` that we extract data from:
 
-> **💡 Terminology:** An **Event** is the actual occurrence on the blockchain (e.g., "Order Filled"). A **Class** (e.g., `PerpFillOrderReportModel`) is the TypeScript blueprint the SDK uses to represent that event in code.
-
 | SDK Class Name | Purpose | Data Extracted |
 | :--- | :--- | :--- |
 | **`PerpFillOrderReportModel`** | **Trade Execution** | `price`, `perps` (quantity), `side`, `orderId` |
