@@ -12,14 +12,59 @@ npm run dev <wallet-address>
 npm run dev Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
 ```
 
-## How It Works
+## 🔄 Process & Data Flow
 
-This tool extracts trading data directly from tx logs using **log-based parsing**:
+1.  **Fetch Transactions**: The script fetches all transactions for your wallet from the Solana RPC.
+2.  **Decode Logs**: It extracts log messages and passes them to the Deriverse SDK (`engine.logsDecode`).
+3.  **Identify Events**: The SDK returns specific class instances for each event type (e.g., `PerpFillOrderReportModel`).
+4.  **Extract Data**: We extract key data (price, quantity, fees, leverage) and map it to a clean JSON structure.
+5.  **Export**: The data is saved to a JSON file.
 
-1. **No IDL Dependency** - Parses raw transaction logs without requiring IDL 
-2. **Event Decoding** - Uses Deriverse SDK to decode program logs into structured trade events
-3. **Order Lifecycle Tracking** - Links order placements, fills, and cancellations
-4. **Position Timeline** - Builds chronological position changes from trade history
+> **Note:** The output JSON includes a `rawEvent` field for every entry, containing the full serialized SDK object. This ensures **zero data loss**.
+
+### 🏷️ Event Type Determination
+
+We determine the event type by checking which **class** the SDK decoded the log into:
+
+*   `PerpFillOrderReportModel` → `"type": "fill"` (Trade execution)
+*   `PerpPlaceOrderReportModel` → `"type": "place"` (Order submission)
+*   `PerpOrderCancelReportModel` → `"type": "cancel"` (Order cancellation)
+*   `PerpFeesReportModel` → `"type": "fee"` (Fee/Rebate payment)
+*   `PerpLiquidateReportModel` → `"type": "liquidate"` (Forced liquidation)
+*   `PerpChangeLeverageReportModel` → `"type": "leverage_change"` (Leverage update)
+*   `PerpSocLossReportModel` → `"type": "soc_loss"` (Socialized loss)
+*   `PerpMassCancelReportModel` → `"type": "mass_cancel"` (Cancel all orders)
+*   `PerpOrderRevokeReportModel` → `"type": "revoke"` (System order revocation)
+
+### 🛠️ SDK Components Used
+
+We rely on specific components from the `@deriverse/kit` SDK to interpret the blockchain data:
+
+#### 1. Core Methods
+*   **`Engine.logsDecode(logs: string[])`**: The critical function. It takes the raw array of log strings from a Solana transaction and attempts to parse them into known Deriverse event models. If a log matches a known format, it returns an instance of that model.
+
+#### 2. Event Models (Classes)
+These are the specific class instances returned by `logsDecode` that we extract data from:
+
+> **💡 Terminology:** An **Event** is the actual occurrence on the blockchain (e.g., "Order Filled"). A **Class** (e.g., `PerpFillOrderReportModel`) is the TypeScript blueprint the SDK uses to represent that event in code.
+
+| SDK Class Name | Purpose | Data Extracted |
+| :--- | :--- | :--- |
+| **`PerpFillOrderReportModel`** | **Trade Execution** | `price`, `perps` (quantity), `side`, `orderId` |
+| **`PerpPlaceOrderReportModel`** | **Order Placement** | `price`, `perps`, `leverage`, `orderType` |
+| **`PerpOrderCancelReportModel`** | **Cancellation** | `orderId`, `side` |
+| **`PerpFeesReportModel`** | **Fees** | `fees` (paid), `refPayment` (rebates) |
+| **`PerpFundingReportModel`** | **Funding** | `funding` (amount paid/received), `instrId` |
+| **`PerpLiquidateReportModel`** | **Liquidation** | `price`, `perps` (amount liquidated), `side` |
+| **`PerpChangeLeverageReportModel`** | **Leverage** | `leverage` (new leverage value) |
+| **`PerpSocLossReportModel`** | **Socialized Loss** | `socLoss` (amount deducted) |
+| **`PerpMassCancelReportModel`** | **Mass Cancel** | `side` (if specific side cancelled) |
+| **`PerpOrderRevokeReportModel`** | **Revocation** | `orderId` (system cancelled order) |
+| **`PerpDepositReportModel`** | **Deposit** | `quantity` (collateral added) |
+| **`PerpWithdrawReportModel`** | **Withdrawal** | `quantity` (collateral removed) |
+
+#### 3. Instances
+*   **`Engine`**: The main SDK class. We instantiate this (even without a connection) to access the static `logsDecode` method and program constants.
 
 
 ## What You Get

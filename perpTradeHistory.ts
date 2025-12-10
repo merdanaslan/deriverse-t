@@ -9,7 +9,7 @@
  * Usage: npx ts-node perpTradeHistory.ts <wallet-address>
  */
 
-import { Engine, LogMessage, PerpFillOrderReportModel, PerpPlaceOrderReportModel, PerpOrderCancelReportModel, PerpDepositReportModel, PerpWithdrawReportModel, PerpFundingReportModel, PerpChangeLeverageReportModel, GetClientDataResponse, GetClientPerpOrdersInfoResponse, VERSION, PROGRAM_ID } from '@deriverse/kit';
+import { Engine, LogMessage, PerpFillOrderReportModel, PerpPlaceOrderReportModel, PerpOrderCancelReportModel, PerpDepositReportModel, PerpWithdrawReportModel, PerpFundingReportModel, PerpChangeLeverageReportModel, PerpFeesReportModel, GetClientDataResponse, GetClientPerpOrdersInfoResponse, VERSION, PROGRAM_ID } from '@deriverse/kit';
 import { Address, createSolanaRpc } from '@solana/kit';
 import { Connection, PublicKey } from '@solana/web3.js';
 import * as fs from 'fs';
@@ -20,14 +20,15 @@ interface PerpTradeData {
   tradeId: string;
   timestamp: number;
   instrumentId: number;
-  side: 'long' | 'short';
+  side: 'long' | 'short' | 'none';
   quantity: number;
   price: number;
   fees: number;
   rebates: number;
   leverage?: number;
-  orderId: number;
-  type: 'fill' | 'place' | 'cancel';
+  orderId: bigint;
+  type: 'fill' | 'place' | 'cancel' | 'liquidate' | 'fee' | 'leverage_change' | 'soc_loss' | 'revoke' | 'mass_cancel' | 'new_order';
+  rawEvent?: any; // Full SDK event object
 }
 
 interface PerpPositionData {
@@ -414,6 +415,24 @@ class PerpTradeHistoryRetriever {
       depositsWithdraws: [] as Array<{ instrumentId: number; timestamp: number; amount: number; type: 'deposit' | 'withdraw'; }>
     };
 
+    // Helper to serialize SDK objects (handling BigInts)
+    const serializeSdkObject = (obj: any): any => {
+      if (obj === null || obj === undefined) return obj;
+      if (typeof obj === 'bigint') return obj.toString();
+      if (Array.isArray(obj)) return obj.map(serializeSdkObject);
+      if (typeof obj === 'object') {
+        const newObj: any = {};
+        for (const key in obj) {
+          // Skip internal properties or circular references if needed
+          if (Object.prototype.hasOwnProperty.call(obj, key)) {
+            newObj[key] = serializeSdkObject(obj[key]);
+          }
+        }
+        return newObj;
+      }
+      return obj;
+    };
+
     for (const tx of transactions) {
       try {
         console.log(`📋 Parsing transaction ${tx.signature.slice(0, 8)}...`);
@@ -426,61 +445,207 @@ class PerpTradeHistoryRetriever {
 
           // Filter for perpetual-related events
           if (log instanceof PerpFillOrderReportModel) {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}`,
               timestamp: timestamp,
-              instrumentId: 0, // Will be determined from the log context
-              side: log.side === 0 ? 'long' : 'short',
-              quantity: Math.abs(log.perps),
-              price: log.price,
-              fees: 0, // Will be in separate fees log
-              rebates: log.rebates,
-              orderId: log.orderId,
-              type: 'fill'
+              instrumentId: logAny.instrId || 0, // Determined from the log context
+              side: log.side === 0 ? 'long' : 'short', // 0 = Long, 1 = Short
+              quantity: Math.abs(Number(log.perps)),
+              price: Number(log.price),
+              fees: Number(logAny.fee || 0), // Extract fee if available
+              rebates: Number(log.rebates || 0),
+              orderId: BigInt(log.orderId),
+              type: 'fill',
+              rawEvent: rawEvent
             });
-            console.log(`   📈 Found perp fill: ${log.side === 0 ? 'LONG' : 'SHORT'} ${Math.abs(log.perps)} @ ${log.price}`);
+            console.log(`   📈 Found perp fill: ${log.side === 0 ? 'LONG' : 'SHORT'} ${Math.abs(Number(log.perps))} @ ${Number(log.price)}`);
           }
 
           if (log instanceof PerpPlaceOrderReportModel) {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}-place`,
               timestamp: log.time || timestamp,
               instrumentId: log.instrId,
               side: log.side === 0 ? 'long' : 'short',
-              quantity: Math.abs(log.perps),
-              price: log.price,
-              fees: 0,
-              rebates: 0,
-              leverage: log.leverage,
-              orderId: log.orderId,
-              type: 'place'
+              quantity: Math.abs(Number(log.perps)),
+              price: Number(log.price),
+              fees: Number(logAny.fee || 0),
+              rebates: Number(logAny.rebates || 0),
+              leverage: Number(log.leverage),
+              orderId: BigInt(log.orderId),
+              type: 'place',
+              rawEvent: rawEvent
             });
-            console.log(`   📝 Found order place: ${log.side === 0 ? 'LONG' : 'SHORT'} ${Math.abs(log.perps)} @ ${log.price}`);
+            console.log(`   📝 Found order place: ${log.side === 0 ? 'LONG' : 'SHORT'} ${Math.abs(Number(log.perps))} @ ${Number(log.price)}`);
+          }
+
+          if (log.constructor.name === 'PerpFeesReportModel') {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
+
+            // Fees are often associated with the most recent fill/trade in the same transaction
+            // We'll add it as a separate event type 'fee' but link it to the orderId if possible
+            result.trades.push({
+              tradeId: `${tx.signature}-${logAny.orderId || 'fee'}-fee`,
+              timestamp: timestamp,
+              instrumentId: 0,
+              side: 'none', // Fees don't have a side in this context
+              quantity: 0,
+              price: 0,
+              fees: Number(logAny.fees || 0),
+              rebates: Number(logAny.refPayment || 0), // Use refPayment for rebates
+              orderId: BigInt(logAny.orderId || 0),
+              type: 'fee',
+              rawEvent: rawEvent
+            });
+            console.log(`   💸 Found perp fee: ${Number(logAny.fees)}`);
           }
 
           if (log instanceof PerpOrderCancelReportModel) {
+            const rawEvent = serializeSdkObject(log);
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}-cancel`,
               timestamp: log.time || timestamp,
-              instrumentId: log.instrId,
+              instrumentId: 0,
               side: log.side === 0 ? 'long' : 'short',
-              quantity: Math.abs(log.perps),
-              price: 0,
+              quantity: Math.abs(Number(log.perps)),
+              price: 0, // Cancel reports don't have a price
               fees: 0,
               rebates: 0,
-              orderId: log.orderId,
-              type: 'cancel'
+              orderId: BigInt(log.orderId),
+              type: 'cancel',
+              rawEvent: rawEvent
             });
             console.log(`   ❌ Found order cancel: ${log.orderId}`);
+          }
+
+          if (log.constructor.name === 'PerpLiquidateReportModel') {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
+            result.trades.push({
+              tradeId: `${tx.signature}-liquidate`,
+              timestamp: timestamp,
+              instrumentId: logAny.instrId || 0,
+              side: logAny.side === 0 ? 'long' : 'short',
+              quantity: Math.abs(Number(logAny.perps || 0)),
+              price: Number(logAny.price || 0),
+              fees: 0, // Liquidations might have penalties, usually in a separate fee event or embedded
+              rebates: 0,
+              orderId: BigInt(0), // Liquidations might not have a standard order ID
+              type: 'liquidate',
+              rawEvent: rawEvent
+            });
+            console.log(`   💧 Found liquidation: ${logAny.side === 0 ? 'LONG' : 'SHORT'} ${Math.abs(Number(logAny.perps))} @ ${Number(logAny.price)}`);
           }
 
           if (log instanceof PerpFundingReportModel) {
             result.funding.push({
               instrumentId: log.instrId,
-              timestamp: log.time || timestamp,
-              fundingAmount: log.funding
+              timestamp: timestamp,
+              fundingAmount: Number(log.funding)
             });
-            console.log(`   💰 Found funding: ${log.funding} for instrument ${log.instrId}`);
+            console.log(`   💰 Found funding: ${Number(log.funding)} for instrument ${log.instrId}`);
+          }
+
+          // --- NEW HANDLERS FOR MISSING EVENTS ---
+
+          if (log instanceof PerpChangeLeverageReportModel) {
+            const rawEvent = serializeSdkObject(log);
+            result.trades.push({
+              tradeId: `${tx.signature}-leverage`,
+              timestamp: timestamp,
+              instrumentId: log.instrId,
+              side: 'none',
+              quantity: 0,
+              price: 0,
+              fees: 0,
+              rebates: 0,
+              leverage: Number(log.leverage),
+              orderId: BigInt(0),
+              type: 'leverage_change',
+              rawEvent: rawEvent
+            });
+            console.log(`   ⚙️ Found leverage change: ${Number(log.leverage)}x`);
+          }
+
+          if (log.constructor.name === 'PerpSocLossReportModel') {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
+            result.trades.push({
+              tradeId: `${tx.signature}-socloss`,
+              timestamp: timestamp,
+              instrumentId: logAny.instrId || 0,
+              side: 'none',
+              quantity: 0,
+              price: 0,
+              fees: Number(logAny.socLoss || 0), // Socialized loss is effectively a fee
+              rebates: 0,
+              orderId: BigInt(0),
+              type: 'soc_loss',
+              rawEvent: rawEvent
+            });
+            console.log(`   📉 Found socialized loss: ${Number(logAny.socLoss)}`);
+          }
+
+          if (log.constructor.name === 'PerpOrderRevokeReportModel') {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
+            result.trades.push({
+              tradeId: `${tx.signature}-${logAny.orderId}-revoke`,
+              timestamp: timestamp,
+              instrumentId: 0,
+              side: logAny.side === 0 ? 'long' : 'short',
+              quantity: Math.abs(Number(logAny.perps || 0)),
+              price: 0,
+              fees: 0,
+              rebates: 0,
+              orderId: BigInt(logAny.orderId || 0),
+              type: 'revoke',
+              rawEvent: rawEvent
+            });
+            console.log(`   🚫 Found order revoke: ${logAny.orderId}`);
+          }
+
+          if (log.constructor.name === 'PerpMassCancelReportModel') {
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
+            result.trades.push({
+              tradeId: `${tx.signature}-mass-cancel`,
+              timestamp: timestamp,
+              instrumentId: 0,
+              side: logAny.side === 0 ? 'long' : 'short',
+              quantity: 0,
+              price: 0,
+              fees: 0,
+              rebates: 0,
+              orderId: BigInt(0),
+              type: 'mass_cancel',
+              rawEvent: rawEvent
+            });
+            console.log(`   💥 Found mass cancel`);
+          }
+
+          if (log.constructor.name === 'PerpNewOrderReportModel') {
+            // This might be redundant with PlaceOrder, but capturing just in case
+            const rawEvent = serializeSdkObject(log);
+            const logAny = log as any;
+            result.trades.push({
+              tradeId: `${tx.signature}-new-order`,
+              timestamp: timestamp,
+              instrumentId: 0,
+              side: logAny.side === 0 ? 'long' : 'short',
+              quantity: Math.abs(Number(logAny.perps || 0)),
+              price: 0,
+              fees: 0,
+              rebates: 0,
+              orderId: BigInt(0),
+              type: 'new_order',
+              rawEvent: rawEvent
+            });
           }
 
           if (log instanceof PerpDepositReportModel) {
@@ -532,7 +697,9 @@ class PerpTradeHistoryRetriever {
     }
 
     const filepath = path.join(process.cwd(), filename);
-    await fs.promises.writeFile(filepath, JSON.stringify(data, null, 2));
+    await fs.promises.writeFile(filepath, JSON.stringify(data, (key, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+      , 2));
 
     console.log(`Trade history exported to: ${filepath}`);
     return filepath;
