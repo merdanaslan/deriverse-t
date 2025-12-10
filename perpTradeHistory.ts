@@ -445,7 +445,7 @@ class PerpTradeHistoryRetriever {
         const decodedLogs = this.engine.logsDecode(tx.logs);
 
         for (const log of decodedLogs) {
-          const timestamp = tx.blockTime * 1000; // Convert to milliseconds
+          const blockTimeMs = tx.blockTime * 1000; // Convert to milliseconds
 
           // Filter for perpetual-related events
           if (log instanceof PerpFillOrderReportModel) {
@@ -453,8 +453,8 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: logAny.instrId || 0, // Determined from the log context
               side: log.side === 0 ? 'long' : 'short', // 0 = Long, 1 = Short
               quantity: Math.abs(Number(log.perps)),
@@ -471,10 +471,11 @@ class PerpTradeHistoryRetriever {
           if (log instanceof PerpPlaceOrderReportModel) {
             const rawEvent = serializeSdkObject(log);
             const logAny = log as any;
+            const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}-place`,
-              timestamp: log.time || timestamp,
-              timeString: new Date((log.time || timestamp) * 1000).toISOString(),
+              timestamp: eventTimeMs,
+              timeString: new Date(eventTimeMs).toISOString(),
               instrumentId: log.instrId,
               side: log.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(log.perps)),
@@ -497,8 +498,8 @@ class PerpTradeHistoryRetriever {
             // We'll add it as a separate event type 'fee' but link it to the orderId if possible
             result.trades.push({
               tradeId: `${tx.signature}-${logAny.orderId || 'fee'}-fee`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
               side: 'none', // Fees don't have a side in this context
               quantity: 0,
@@ -514,10 +515,11 @@ class PerpTradeHistoryRetriever {
 
           if (log instanceof PerpOrderCancelReportModel) {
             const rawEvent = serializeSdkObject(log);
+            const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}-cancel`,
-              timestamp: log.time || timestamp,
-              timeString: new Date((log.time || timestamp) * 1000).toISOString(),
+              timestamp: eventTimeMs,
+              timeString: new Date(eventTimeMs).toISOString(),
               instrumentId: 0,
               side: log.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(log.perps)),
@@ -536,8 +538,8 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-liquidate`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: logAny.instrId || 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(logAny.perps || 0)),
@@ -552,10 +554,11 @@ class PerpTradeHistoryRetriever {
           }
 
           if (log instanceof PerpFundingReportModel) {
+            const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             result.funding.push({
               instrumentId: log.instrId,
-              timestamp: timestamp,
-              timeString: new Date(timestamp).toISOString(),
+              timestamp: eventTimeMs,
+              timeString: new Date(eventTimeMs).toISOString(),
               fundingAmount: Number(log.funding)
             });
             console.log(`   💰 Found funding: ${Number(log.funding)} for instrument ${log.instrId}`);
@@ -567,8 +570,8 @@ class PerpTradeHistoryRetriever {
             const rawEvent = serializeSdkObject(log);
             result.trades.push({
               tradeId: `${tx.signature}-leverage`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: log.instrId,
               side: 'none',
               quantity: 0,
@@ -588,8 +591,8 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-socloss`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: logAny.instrId || 0,
               side: 'none',
               quantity: 0,
@@ -608,8 +611,8 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-${logAny.orderId}-revoke`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(logAny.perps || 0)),
@@ -628,8 +631,8 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-mass-cancel`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: 0,
@@ -649,8 +652,8 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-new-order`,
-              timestamp: timestamp,
-              timeString: new Date(timestamp * 1000).toISOString(),
+              timestamp: blockTimeMs,
+              timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(logAny.perps || 0)),
@@ -664,23 +667,25 @@ class PerpTradeHistoryRetriever {
           }
 
           if (log instanceof PerpDepositReportModel) {
+            const logAny = log as any;
             result.depositsWithdraws.push({
               instrumentId: log.instrId,
-              timestamp: log.time || timestamp,
-              amount: log.amount,
+              timestamp: blockTimeMs,
+              amount: Number(logAny.quantity || logAny.qty || logAny.amount || 0),
               type: 'deposit'
             });
-            console.log(`   ⬇️ Found deposit: ${log.amount} for instrument ${log.instrId}`);
+            console.log(`   ⬇️ Found deposit: ${Number(logAny.quantity || logAny.qty || logAny.amount || 0)} for instrument ${log.instrId}`);
           }
 
           if (log instanceof PerpWithdrawReportModel) {
+            const logAny = log as any;
             result.depositsWithdraws.push({
               instrumentId: log.instrId,
-              timestamp: log.time || timestamp,
-              amount: log.amount,
+              timestamp: blockTimeMs,
+              amount: Number(logAny.quantity || logAny.qty || logAny.amount || 0),
               type: 'withdraw'
             });
-            console.log(`   ⬆️ Found withdraw: ${log.amount} for instrument ${log.instrId}`);
+            console.log(`   ⬆️ Found withdraw: ${Number(logAny.quantity || logAny.qty || logAny.amount || 0)} for instrument ${log.instrId}`);
           }
         }
 
@@ -688,6 +693,10 @@ class PerpTradeHistoryRetriever {
         console.warn(`⚠️ Error decoding logs for transaction ${tx.signature}: ${error}`);
       }
     }
+
+    // Sort trades by timestamp descending (newest first)
+    result.trades.sort((a, b) => b.timestamp - a.timestamp);
+    result.funding.sort((a, b) => b.timestamp - a.timestamp);
 
     return result;
   }
