@@ -19,6 +19,7 @@ import * as path from 'path';
 interface PerpTradeData {
   tradeId: string;
   timestamp: number;
+  timeString: string; // ISO formatted date string
   instrumentId: number;
   side: 'long' | 'short' | 'none';
   quantity: number;
@@ -29,6 +30,13 @@ interface PerpTradeData {
   orderId: bigint;
   type: 'fill' | 'place' | 'cancel' | 'liquidate' | 'fee' | 'leverage_change' | 'soc_loss' | 'revoke' | 'mass_cancel' | 'new_order';
   rawEvent?: any; // Full SDK event object
+}
+
+interface PerpFundingData {
+  instrumentId: number;
+  timestamp: number;
+  timeString: string;
+  fundingAmount: number;
 }
 
 interface PerpPositionData {
@@ -54,11 +62,7 @@ interface PerpTradingHistory {
   totalPerpTrades: number;
   positions: PerpPositionData[];
   tradeHistory: PerpTradeData[];
-  fundingHistory: Array<{
-    instrumentId: number;
-    timestamp: number;
-    fundingAmount: number;
-  }>;
+  fundingHistory: PerpFundingData[];
   depositWithdrawHistory: Array<{
     instrumentId: number;
     timestamp: number;
@@ -406,12 +410,12 @@ class PerpTradeHistoryRetriever {
 
   private async parseAllTransactionLogs(transactions: Array<{ signature: string; blockTime: number; logs: string[] }>): Promise<{
     trades: PerpTradeData[];
-    funding: Array<{ instrumentId: number; timestamp: number; fundingAmount: number; }>;
+    funding: PerpFundingData[];
     depositsWithdraws: Array<{ instrumentId: number; timestamp: number; amount: number; type: 'deposit' | 'withdraw'; }>;
   }> {
     const result = {
       trades: [] as PerpTradeData[],
-      funding: [] as Array<{ instrumentId: number; timestamp: number; fundingAmount: number; }>,
+      funding: [] as PerpFundingData[],
       depositsWithdraws: [] as Array<{ instrumentId: number; timestamp: number; amount: number; type: 'deposit' | 'withdraw'; }>
     };
 
@@ -450,6 +454,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: logAny.instrId || 0, // Determined from the log context
               side: log.side === 0 ? 'long' : 'short', // 0 = Long, 1 = Short
               quantity: Math.abs(Number(log.perps)),
@@ -469,6 +474,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}-place`,
               timestamp: log.time || timestamp,
+              timeString: new Date((log.time || timestamp) * 1000).toISOString(),
               instrumentId: log.instrId,
               side: log.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(log.perps)),
@@ -492,6 +498,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-${logAny.orderId || 'fee'}-fee`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: 0,
               side: 'none', // Fees don't have a side in this context
               quantity: 0,
@@ -510,6 +517,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-${log.orderId}-cancel`,
               timestamp: log.time || timestamp,
+              timeString: new Date((log.time || timestamp) * 1000).toISOString(),
               instrumentId: 0,
               side: log.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(log.perps)),
@@ -529,6 +537,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-liquidate`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: logAny.instrId || 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(logAny.perps || 0)),
@@ -546,6 +555,7 @@ class PerpTradeHistoryRetriever {
             result.funding.push({
               instrumentId: log.instrId,
               timestamp: timestamp,
+              timeString: new Date(timestamp).toISOString(),
               fundingAmount: Number(log.funding)
             });
             console.log(`   💰 Found funding: ${Number(log.funding)} for instrument ${log.instrId}`);
@@ -558,6 +568,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-leverage`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: log.instrId,
               side: 'none',
               quantity: 0,
@@ -578,6 +589,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-socloss`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: logAny.instrId || 0,
               side: 'none',
               quantity: 0,
@@ -597,6 +609,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-${logAny.orderId}-revoke`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(logAny.perps || 0)),
@@ -616,6 +629,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-mass-cancel`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: 0,
@@ -636,6 +650,7 @@ class PerpTradeHistoryRetriever {
             result.trades.push({
               tradeId: `${tx.signature}-new-order`,
               timestamp: timestamp,
+              timeString: new Date(timestamp * 1000).toISOString(),
               instrumentId: 0,
               side: logAny.side === 0 ? 'long' : 'short',
               quantity: Math.abs(Number(logAny.perps || 0)),
