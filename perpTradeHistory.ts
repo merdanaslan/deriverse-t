@@ -443,6 +443,11 @@ class PerpTradeHistoryRetriever {
         // Decode logs using the engine's log decoder
         const decodedLogs = this.engine.logsDecode(tx.logs);
 
+        // Track fills and fees for this transaction to link them
+        const txFills: PerpTradeData[] = [];
+        let txTotalFees = 0;
+        let txTotalRebates = 0;
+
         for (const log of decodedLogs) {
           const blockTimeMs = tx.blockTime * 1000; // Convert to milliseconds
 
@@ -466,6 +471,7 @@ class PerpTradeHistoryRetriever {
             };
             result.trades.push(tradeData);
             result.filledOrders.push(tradeData);
+            txFills.push(tradeData); // Add to local list for fee linking
             console.log(`   📈 Found perp fill: ${log.side === 0 ? 'SHORT' : 'LONG'} ${Math.abs(Number(log.perps)) / 1e9} SOL @ ${log.price}`);
           }
 
@@ -511,6 +517,11 @@ class PerpTradeHistoryRetriever {
               type: 'fee',
               rawEvent: rawEvent
             });
+
+            // Accumulate fees for this transaction
+            txTotalFees += Number(logAny.fees || 0);
+            txTotalRebates += Number(logAny.refPayment || 0);
+
             console.log(`   💸 Found perp fee: ${Number(logAny.fees)}`);
           }
 
@@ -688,6 +699,19 @@ class PerpTradeHistoryRetriever {
             });
             console.log(`   ⬆️ Found withdraw: ${Number(logAny.quantity || logAny.qty || logAny.amount || 0) / 1e9} SOL for instrument ${log.instrId}`);
           }
+        }
+
+        // After processing logs for this transaction, distribute fees/rebates to fills
+        if (txFills.length > 0 && (txTotalFees > 0 || txTotalRebates > 0)) {
+          const totalQty = txFills.reduce((sum, t) => sum + t.quantity, 0);
+
+          for (const fill of txFills) {
+            const ratio = totalQty > 0 ? fill.quantity / totalQty : 0;
+            // Update the fill object (reference is shared in result.trades and result.filledOrders)
+            fill.fees += txTotalFees * ratio;
+            fill.rebates += txTotalRebates * ratio;
+          }
+          console.log(`   🔗 Linked ${txTotalFees} fees and ${txTotalRebates} rebates to ${txFills.length} fills`);
         }
 
       } catch (error) {
