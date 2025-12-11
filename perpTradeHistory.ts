@@ -30,6 +30,12 @@ interface PerpTradeData {
   orderId: bigint;
   type: 'fill' | 'place' | 'cancel' | 'liquidate' | 'fee' | 'leverage_change' | 'soc_loss' | 'revoke' | 'mass_cancel' | 'new_order';
   rawEvent?: any; // Full SDK event object
+  // Enhanced fields for fills
+  effectiveLeverage?: number;
+  leverageSource?: 'place_order' | 'timeline' | 'transaction_inferred' | 'default_10x';
+  limitPrice?: number;
+  marginUsed?: number;
+  priceImprovement?: number;
 }
 
 interface PerpFundingData {
@@ -85,6 +91,7 @@ class PerpTradeHistoryRetriever {
   private connection: Connection;
   private startDate: Date;
   private endDate: Date;
+  private leverageTimeline: Map<number, Array<{timestamp: number, leverage: number}>> = new Map();
 
   constructor(rpcUrl: string = 'https://api.devnet.solana.com', startDate?: Date, endDate?: Date) {
     const rpc = createSolanaRpc(rpcUrl);
@@ -405,6 +412,44 @@ class PerpTradeHistoryRetriever {
     }
   }
 
+  private async buildCompleteLeverageTimeline(transactions: Array<{ signature: string; blockTime: number; logs: string[] }>): Promise<void> {
+    console.log(`🔧 Pre-scanning ${transactions.length} transactions for leverage changes...`);
+    
+    for (const tx of transactions) {
+      try {
+        const decodedLogs = this.engine.logsDecode(tx.logs);
+        
+        for (const log of decodedLogs) {
+          if (log instanceof PerpChangeLeverageReportModel) {
+            const blockTimeMs = tx.blockTime * 1000;
+            
+            // Add to leverage timeline
+            if (!this.leverageTimeline.has(log.instrId)) {
+              this.leverageTimeline.set(log.instrId, []);
+            }
+            this.leverageTimeline.get(log.instrId)!.push({
+              timestamp: blockTimeMs,
+              leverage: Number(log.leverage)
+            });
+            
+            console.log(`   ⚙️ Added leverage change: ${Number(log.leverage)}x for instrument ${log.instrId} at ${new Date(blockTimeMs).toISOString()}`);
+          }
+        }
+      } catch (error) {
+        // Silently skip transactions that can't be decoded during timeline building
+      }
+    }
+
+    // Sort all timelines chronologically after building
+    for (const [instrId, timeline] of this.leverageTimeline) {
+      timeline.sort((a, b) => a.timestamp - b.timestamp);
+      console.log(`📊 Built leverage timeline for instrument ${instrId}: ${timeline.length} changes`);
+      if (timeline.length > 0) {
+        console.log(`   📅 Timeline spans: ${new Date(timeline[0].timestamp).toISOString()} to ${new Date(timeline[timeline.length - 1].timestamp).toISOString()}`);
+      }
+    }
+  }
+
   private async parseAllTransactionLogs(transactions: Array<{ signature: string; blockTime: number; logs: string[] }>): Promise<{
     trades: PerpTradeData[];
     filledOrders: PerpTradeData[];
@@ -417,6 +462,10 @@ class PerpTradeHistoryRetriever {
       funding: [] as PerpFundingData[],
       depositsWithdraws: [] as Array<{ instrumentId: number; timestamp: number; amount: number; type: 'deposit' | 'withdraw'; }>
     };
+
+    // PHASE 1: Pre-scan all transactions to build complete leverage timeline
+    console.log('📊 Phase 1: Building complete leverage timeline from all transactions...');
+    await this.buildCompleteLeverageTimeline(transactions);
 
     // Helper to serialize SDK objects (handling BigInts)
     const serializeSdkObject = (obj: any): any => {
@@ -445,6 +494,7 @@ class PerpTradeHistoryRetriever {
 
         // Track fills and fees for this transaction to link them
         const txFills: PerpTradeData[] = [];
+        const txPlaceOrders: PerpTradeData[] = [];
         let txTotalFees = 0;
         let txTotalRebates = 0;
 
@@ -479,7 +529,7 @@ class PerpTradeHistoryRetriever {
             const rawEvent = serializeSdkObject(log);
             const logAny = log as any;
             const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
-            result.trades.push({
+            const placeOrder: PerpTradeData = {
               tradeId: `${tx.signature}-${log.orderId}-place`,
               timestamp: eventTimeMs,
               timeString: new Date(eventTimeMs).toISOString(),
@@ -493,7 +543,9 @@ class PerpTradeHistoryRetriever {
               orderId: BigInt(log.orderId),
               type: 'place',
               rawEvent: rawEvent
-            });
+            };
+            result.trades.push(placeOrder);
+            txPlaceOrders.push(placeOrder); // Track for linking
             console.log(`   📝 Found order place: ${log.side === 0 ? 'SHORT' : 'LONG'} ${Math.abs(Number(log.perps)) / 1e9} @ ${Number(log.price)}`);
           }
 
@@ -580,6 +632,7 @@ class PerpTradeHistoryRetriever {
 
           if (log instanceof PerpChangeLeverageReportModel) {
             const rawEvent = serializeSdkObject(log);
+
             result.trades.push({
               tradeId: `${tx.signature}-leverage`,
               timestamp: blockTimeMs,
@@ -595,7 +648,8 @@ class PerpTradeHistoryRetriever {
               type: 'leverage_change',
               rawEvent: rawEvent
             });
-            console.log(`   ⚙️ Found leverage change: ${Number(log.leverage)}x`);
+
+            console.log(`   ⚙️ Found leverage change: ${Number(log.leverage)}x for instrument ${log.instrId} at ${new Date(blockTimeMs).toISOString()}`);
           }
 
           if (log.constructor.name === 'PerpSocLossReportModel') {
@@ -714,6 +768,9 @@ class PerpTradeHistoryRetriever {
           console.log(`   🔗 Linked ${txTotalFees} fees and ${txTotalRebates} rebates to ${txFills.length} fills`);
         }
 
+        // Enhance fills with leverage data from place orders in same transaction
+        await this.enhanceFillsWithLeverage(txFills, txPlaceOrders, tx.signature);
+
       } catch (error) {
         console.warn(`⚠️ Error decoding logs for transaction ${tx.signature}: ${error}`);
       }
@@ -724,7 +781,104 @@ class PerpTradeHistoryRetriever {
     result.filledOrders.sort((a, b) => b.timestamp - a.timestamp);
     result.funding.sort((a, b) => b.timestamp - a.timestamp);
 
+    // Timeline is already sorted incrementally as events are processed
+    console.log(`📊 Leverage timeline summary:`);
+    for (const [instrId, timeline] of this.leverageTimeline) {
+      console.log(`   Instrument ${instrId}: ${timeline.length} leverage changes`);
+    }
+
     return result;
+  }
+
+  private getLeverageAtTime(timestamp: number, instrumentId: number): number | null {
+    const timeline = this.leverageTimeline.get(instrumentId);
+    console.log(`🔍 Timeline lookup for instrument ${instrumentId} at ${timestamp} (${new Date(timestamp).toISOString()})`);
+    
+    if (!timeline || timeline.length === 0) {
+      console.log(`   ❌ No timeline found for instrument ${instrumentId}`);
+      return null;
+    }
+
+    console.log(`   📊 Timeline has ${timeline.length} entries:`, timeline.map(t => `${t.leverage}x@${new Date(t.timestamp).toISOString()}`));
+
+    // Find the most recent leverage change before or at the given timestamp
+    for (let i = timeline.length - 1; i >= 0; i--) {
+      console.log(`   🔍 Checking ${timeline[i].leverage}x at ${timeline[i].timestamp} <= ${timestamp}?`, timeline[i].timestamp <= timestamp);
+      if (timeline[i].timestamp <= timestamp) {
+        console.log(`   ✅ Found timeline leverage: ${timeline[i].leverage}x from ${new Date(timeline[i].timestamp).toISOString()}`);
+        return timeline[i].leverage;
+      }
+    }
+
+    console.log(`   ❌ No leverage change found before timestamp ${new Date(timestamp).toISOString()}`);
+    return null; // No leverage change found before this timestamp
+  }
+
+  private async enhanceFillsWithLeverage(fills: PerpTradeData[], placeOrders: PerpTradeData[], txSignature: string): Promise<void> {
+    console.log(`   ⚙️ Enhancing ${fills.length} fills with leverage data from ${placeOrders.length} place orders`);
+
+    for (const fill of fills) {
+      // Find matching place order in same transaction by OPPOSITE side (counterpart trades) and similar quantity/timing
+      const oppositeSide = fill.side === 'long' ? 'short' : 'long';
+      const matchingPlace = placeOrders.find(place => {
+        return place.side === oppositeSide && 
+               Math.abs(place.quantity - fill.quantity) < 0.1 && // Similar quantity (allow small difference)
+               Math.abs(place.timestamp - fill.timestamp) < 5000; // Within 5 seconds
+      });
+
+      if (matchingPlace) {
+        // Enhanced leverage resolution for matched place orders
+        if (matchingPlace.leverage && matchingPlace.leverage > 0) {
+          // Use explicit leverage from place order
+          fill.effectiveLeverage = matchingPlace.leverage;
+          fill.leverageSource = 'place_order';
+        } else {
+          // Place order had leverage = 0, use timeline lookup
+          const timelineLeverage = this.getLeverageAtTime(matchingPlace.timestamp, matchingPlace.instrumentId);
+          if (timelineLeverage) {
+            fill.effectiveLeverage = timelineLeverage;
+            fill.leverageSource = 'timeline';
+          } else {
+            // No timeline data, use system default
+            fill.effectiveLeverage = 10;
+            fill.leverageSource = 'default_10x';
+          }
+        }
+        
+        fill.limitPrice = matchingPlace.price;
+        fill.priceImprovement = fill.side === 'long' ? 
+          (fill.price - matchingPlace.price) : 
+          (matchingPlace.price - fill.price);
+        
+        console.log(`     🔗 Linked fill ${fill.orderId} to place ${matchingPlace.orderId} with ${fill.effectiveLeverage}x leverage (${fill.leverageSource})`);
+      } else {
+        // No matching place order found, use timeline lookup for fill timestamp
+        const timelineLeverage = this.getLeverageAtTime(fill.timestamp, fill.instrumentId);
+        if (timelineLeverage) {
+          fill.effectiveLeverage = timelineLeverage;
+          fill.leverageSource = 'timeline';
+          console.log(`     📈 Used timeline leverage for fill ${fill.orderId}: ${fill.effectiveLeverage}x`);
+        } else {
+          // Check for transaction-level inference
+          const txLeverage = placeOrders.find(place => place.leverage && place.leverage > 0);
+          if (txLeverage) {
+            fill.effectiveLeverage = txLeverage.leverage!;
+            fill.leverageSource = 'transaction_inferred';
+            console.log(`     📊 Inferred leverage for fill ${fill.orderId} from transaction: ${fill.effectiveLeverage}x`);
+          } else {
+            // Final fallback to system default
+            fill.effectiveLeverage = 10;
+            fill.leverageSource = 'default_10x';
+            console.log(`     ⚠️ No leverage data found for fill ${fill.orderId}, using default 10x leverage`);
+          }
+        }
+      }
+
+      // Calculate margin used if leverage is available
+      if (fill.effectiveLeverage && fill.effectiveLeverage > 0) {
+        fill.marginUsed = (fill.quantity * fill.price) / fill.effectiveLeverage;
+      }
+    }
   }
 
   private calculateSummary(history: PerpTradingHistory): PerpTradingHistory['summary'] {
