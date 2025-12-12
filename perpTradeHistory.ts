@@ -23,6 +23,7 @@ interface PerpTradeData {
   instrumentId: number;
   side: 'long' | 'short' | 'none';
   quantity: number;
+  notionalValue?: number; // quantity * price (for fills)
   price: number;
   fees: number;
   rebates: number;
@@ -505,14 +506,17 @@ class PerpTradeHistoryRetriever {
           if (log instanceof PerpFillOrderReportModel) {
             const rawEvent = serializeSdkObject(log);
             const logAny = log as any;
+            const quantity = Math.abs(Number(log.perps)) / 1e9; // Convert to SOL (9 decimals)
+            const price = Number(log.price);
             const tradeData: PerpTradeData = {
               tradeId: `${tx.signature}-${log.orderId}`,
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: logAny.instrId || 0, // Determined from the log context
               side: log.side === 0 ? 'short' : 'long', // 0 = Short, 1 = Long
-              quantity: Math.abs(Number(log.perps)) / 1e9, // Convert to SOL (9 decimals)
-              price: Number(log.price),
+              quantity: quantity,
+              notionalValue: quantity * price, // Total USD value of the trade
+              price: price,
               fees: Number(logAny.fee || 0), // Extract fee if available
               rebates: Number(log.rebates || 0),
               orderId: BigInt(log.orderId),
