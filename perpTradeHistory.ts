@@ -21,6 +21,8 @@ interface PerpTradeData {
   timestamp: number;
   timeString: string; // ISO formatted date string
   instrumentId: number;
+  asset?: string; // Asset symbol (e.g., SOL, BTC)
+  market?: string; // Trading pair (e.g., SOL/USDC)
   side: 'long' | 'short' | 'none';
   quantity: number;
   notionalValue?: number; // quantity * price (for fills)
@@ -123,6 +125,18 @@ class PerpTradeHistoryRetriever {
       console.log(`🎯 Program ID: ${this.engine.programId}`);
       console.log(`🌐 Connected instruments: ${this.engine.instruments.size}`);
       console.log(`💰 Connected tokens: ${this.engine.tokens.size}`);
+      
+      // Debug instruments details
+      console.log('\n🔍 Exploring instruments:');
+      for (const [instrId, instrument] of this.engine.instruments) {
+        console.log(`   Instrument ${instrId}:`, instrument);
+      }
+      
+      // Debug tokens details
+      console.log('\n🔍 Exploring tokens:');
+      for (const [tokenId, token] of this.engine.tokens) {
+        console.log(`   Token ${tokenId}:`, token);
+      }
 
     } catch (error: any) {
       console.log('⚠️ Initialization warning:', error.message);
@@ -413,6 +427,17 @@ class PerpTradeHistoryRetriever {
     }
   }
 
+
+  private getAssetFromInstrumentId(instrumentId: number): string {
+    // SOL is the only perpetual asset available on Deriverse devnet
+    return 'SOL';
+  }
+
+  private getMarketFromInstrumentId(instrumentId: number): string {
+    // SOL/USDC is the only perpetual market on Deriverse devnet
+    return 'SOL/USDC';
+  }
+
   private async buildCompleteLeverageTimeline(transactions: Array<{ signature: string; blockTime: number; logs: string[] }>): Promise<void> {
     console.log(`🔧 Pre-scanning ${transactions.length} transactions for leverage changes...`);
     
@@ -508,17 +533,20 @@ class PerpTradeHistoryRetriever {
             const logAny = log as any;
             const quantity = Math.abs(Number(log.perps)) / 1e9; // Convert to SOL (9 decimals)
             const price = Number(log.price);
+            const instrumentId = logAny.instrId || 0;
             const tradeData: PerpTradeData = {
               tradeId: `${tx.signature}-${log.orderId}`,
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
-              instrumentId: logAny.instrId || 0, // Determined from the log context
+              instrumentId: instrumentId,
+              asset: this.getAssetFromInstrumentId(instrumentId),
+              market: this.getMarketFromInstrumentId(instrumentId),
               side: log.side === 0 ? 'short' : 'long', // 0 = Short, 1 = Long
               quantity: quantity,
               notionalValue: quantity * price, // Total USD value of the trade
               price: price,
-              fees: Number(logAny.fee || 0), // Extract fee if available
-              rebates: Number(log.rebates || 0),
+              fees: Number(logAny.fee || 0) / 1e6, // Convert from raw USDC value to decimal
+              rebates: Number(log.rebates || 0) / 1e6, // Convert from raw USDC value to decimal
               orderId: BigInt(log.orderId),
               type: 'fill',
               rawEvent: rawEvent
@@ -538,11 +566,13 @@ class PerpTradeHistoryRetriever {
               timestamp: eventTimeMs,
               timeString: new Date(eventTimeMs).toISOString(),
               instrumentId: log.instrId,
+              asset: this.getAssetFromInstrumentId(log.instrId),
+              market: this.getMarketFromInstrumentId(log.instrId),
               side: log.side === 0 ? 'short' : 'long',
               quantity: Math.abs(Number(log.perps)) / 1e9,
               price: Number(log.price),
-              fees: Number(logAny.fee || 0),
-              rebates: Number(logAny.rebates || 0),
+              fees: Number(logAny.fee || 0) / 1e6, // Convert from raw USDC value to decimal
+              rebates: Number(logAny.rebates || 0) / 1e6, // Convert from raw USDC value to decimal
               leverage: Number(log.leverage),
               orderId: BigInt(log.orderId),
               type: 'place',
@@ -564,21 +594,23 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
+              asset: this.getAssetFromInstrumentId(0),
+              market: this.getMarketFromInstrumentId(0),
               side: 'none', // Fees don't have a side in this context
               quantity: 0,
               price: 0,
-              fees: Number(logAny.fees || 0),
-              rebates: Number(logAny.refPayment || 0), // Use refPayment for rebates
+              fees: Number(logAny.fees || 0) / 1e6, // Convert from raw USDC value to decimal
+              rebates: Number(logAny.refPayment || 0) / 1e6, // Convert from raw USDC value to decimal
               orderId: BigInt(logAny.orderId || 0),
               type: 'fee',
               rawEvent: rawEvent
             });
 
-            // Accumulate fees for this transaction
-            txTotalFees += Number(logAny.fees || 0);
-            txTotalRebates += Number(logAny.refPayment || 0);
+            // Accumulate fees for this transaction (convert from raw USDC to decimal)
+            txTotalFees += Number(logAny.fees || 0) / 1e6;
+            txTotalRebates += Number(logAny.refPayment || 0) / 1e6;
 
-            console.log(`   💸 Found perp fee: ${Number(logAny.fees)}`);
+            console.log(`   💸 Found perp fee: ${Number(logAny.fees) / 1e6} USDC`);
           }
 
           if (log instanceof PerpOrderCancelReportModel) {
@@ -589,6 +621,8 @@ class PerpTradeHistoryRetriever {
               timestamp: eventTimeMs,
               timeString: new Date(eventTimeMs).toISOString(),
               instrumentId: 0,
+              asset: this.getAssetFromInstrumentId(0),
+              market: this.getMarketFromInstrumentId(0),
               side: log.side === 0 ? 'short' : 'long',
               quantity: Math.abs(Number(log.perps)) / 1e9,
               price: 0, // Cancel reports don't have a price
@@ -609,6 +643,8 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: logAny.instrId || 0,
+              asset: this.getAssetFromInstrumentId(logAny.instrId || 0),
+              market: this.getMarketFromInstrumentId(logAny.instrId || 0),
               side: logAny.side === 0 ? 'short' : 'long',
               quantity: Math.abs(Number(logAny.perps || 0)) / 1e9,
               price: Number(logAny.price || 0),
@@ -642,6 +678,8 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: log.instrId,
+              asset: this.getAssetFromInstrumentId(log.instrId),
+              market: this.getMarketFromInstrumentId(log.instrId),
               side: 'none',
               quantity: 0,
               price: 0,
@@ -664,16 +702,18 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: logAny.instrId || 0,
+              asset: this.getAssetFromInstrumentId(logAny.instrId || 0),
+              market: this.getMarketFromInstrumentId(logAny.instrId || 0),
               side: 'none',
               quantity: 0,
               price: 0,
-              fees: Number(logAny.socLoss || 0), // Socialized loss is effectively a fee
+              fees: Number(logAny.socLoss || 0) / 1e6, // Convert from raw USDC value to decimal (socialized loss is effectively a fee)
               rebates: 0,
               orderId: BigInt(0),
               type: 'soc_loss',
               rawEvent: rawEvent
             });
-            console.log(`   📉 Found socialized loss: ${Number(logAny.socLoss)}`);
+            console.log(`   📉 Found socialized loss: ${Number(logAny.socLoss) / 1e6} USDC`);
           }
 
           if (log.constructor.name === 'PerpOrderRevokeReportModel') {
@@ -684,6 +724,8 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
+              asset: this.getAssetFromInstrumentId(0),
+              market: this.getMarketFromInstrumentId(0),
               side: logAny.side === 0 ? 'short' : 'long',
               quantity: Math.abs(Number(logAny.perps || 0)),
               price: 0,
@@ -704,6 +746,8 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
+              asset: this.getAssetFromInstrumentId(0),
+              market: this.getMarketFromInstrumentId(0),
               side: logAny.side === 0 ? 'short' : 'long',
               quantity: 0,
               price: 0,
@@ -725,6 +769,8 @@ class PerpTradeHistoryRetriever {
               timestamp: blockTimeMs,
               timeString: new Date(blockTimeMs).toISOString(),
               instrumentId: 0,
+              asset: this.getAssetFromInstrumentId(0),
+              market: this.getMarketFromInstrumentId(0),
               side: logAny.side === 0 ? 'short' : 'long',
               quantity: Math.abs(Number(logAny.perps || 0)) / 1e9,
               price: 0,
