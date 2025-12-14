@@ -18,7 +18,9 @@ npm run dev Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
 2.  **Decode Logs**: It extracts log messages and passes them to the Deriverse SDK (`engine.logsDecode`).
 3.  **Identify Events**: The SDK returns specific class instances for each event type (e.g., `PerpFillOrderReportModel`).
 4.  **Extract Data**: We extract key data (price, quantity, fees, leverage) and map it to a clean JSON structure.
-5.  **Export**: The data is saved to a JSON file.
+5.  **Enhance Fills**: Link leverage data and calculate price improvement for each fill.
+6.  **Group Trades**: Track position balance to group fills into complete trade lifecycles (open → peak → close).
+7.  **Export**: The enhanced data is saved to a JSON file.
 
 > **Note:** The output JSON includes a `rawEvent` field for every entry, containing the full serialized SDK object. This ensures **zero data loss**.
 
@@ -65,6 +67,30 @@ These are the specific class instances returned by `logsDecode` that we extract 
 *   **`Engine`**: The main SDK class. We instantiate this (even without a connection) to access the static `logsDecode` method and program constants.
 
 
+## 🔗 Trade Grouping Logic
+
+The script uses **position balance tracking** (not simple quantity matching) to group fills into complete trade lifecycles:
+
+### Position Balance Method
+- **Running Balance**: Tracks cumulative position (+quantity for long, -quantity for short)
+- **State Detection**: Identifies position transitions:
+  - `comesFromZero`: Balance 0 → non-zero *(opens new trade)*
+  - `goesToZero`: Balance non-zero → 0 *(closes trade)*
+  - `crossesZero`: Positive ↔ negative *(flips position)*
+
+### Example Trade Lifecycle
+```
+Long 3 SOL:   balance 0 → +3    (opens long trade)
+Short 1 SOL:  balance +3 → +2   (reduces position, same trade)  
+Short 2 SOL:  balance +2 → 0    (closes trade)
+Short 4 SOL:  balance 0 → -4    (opens new short trade)
+```
+
+### Peak Tracking
+- **Peak Quantity**: Maximum position size reached during trade lifecycle
+- **Peak Notional**: Peak USD exposure (peak quantity × entry price)
+- **Weighted Averages**: Entry/exit prices calculated across multiple fills
+
 ## What You Get
 
 ### 📊 Complete Trading Data
@@ -75,11 +101,13 @@ These are the specific class instances returned by `logsDecode` that we extract 
 - **Account Activity**: Deposits, withdrawals, leverage adjustments
 
 ### 📈 Advanced Analytics
-- Order completion rates and partial fill analysis
-- Position-weighted average entry prices
-- Comprehensive fee and rebate tracking
-- Socialized loss events (if any)
-- Leverage change history
+- **Complete Position Lifecycles**: Open → peak exposure → close tracking
+- **Peak Exposure Analysis**: Maximum position size and collateral usage during trades
+- **Weighted Average Pricing**: Entry/exit prices calculated across multiple fills
+- **Enhanced Fill Metadata**: Leverage source detection, price improvement calculation
+- **Position Balance Tracking**: Sophisticated grouping logic for complex trading patterns
+- **Comprehensive Fee Analysis**: Fee/rebate tracking with proper fill attribution
+- **Leverage Timeline**: Historical leverage changes with timestamp correlation
 
 
 
@@ -100,9 +128,10 @@ These are the specific class instances returned by `logsDecode` that we extract 
 ## Data Structure
 
 The JSON export contains:
-- `tradeHistory[]` - All trading events with order linking
-- `orderLifecycles[]` - Complete order state transitions  
-- `positionSnapshots[]` - Position changes over time
+- `tradeHistory[]` - All trading events chronologically ordered
+- `filledOrders[]` - Individual fill events with enhanced metadata (leverage, price improvement)
+- `trades[]` - **Grouped position lifecycles** with entry/exit tracking and peak exposure analysis
 - `fundingHistory[]` - Funding payment records
-- `feeHistory[]` - Fee breakdowns by trade
-- `summary` - Aggregated statistics
+- `depositWithdrawHistory[]` - Account balance changes
+- `positions[]` - Current position snapshots (if available)
+- `summary` - Aggregated statistics and performance metrics
