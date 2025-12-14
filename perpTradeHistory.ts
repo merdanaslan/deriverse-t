@@ -65,6 +65,33 @@ interface PerpPositionData {
   lastUpdateSlot: number;
 }
 
+interface PerpTradeGroup {
+  tradeId: string;
+  instrumentId: number;
+  asset: string;
+  market: string;
+  direction: 'long' | 'short'; // Direction of the opening position
+  status: 'closed' | 'open';
+  quantity: number; // Peak position size reached during trade lifecycle
+  peakQuantity: number; // Maximum position size reached (same as quantity for consistency)
+  entryPrice: number; // Value-weighted average price of all position increases
+  exitPrice?: number; // Value-weighted average price of all position decreases (if closed)
+  entryTime: string; // Timestamp of first fill
+  exitTime?: string; // Timestamp of last fill (if closed)
+  realizedPnL?: number; // Profit/loss in USDC based on peak quantity
+  realizedPnLPercent?: number; // PnL as percentage of peak notional
+  totalFees: number; // Total fees paid across all fills
+  totalRebates: number; // Total rebates received across all fills
+  netFees: number; // totalFees - totalRebates
+  leverage?: number; // Leverage from entry fills
+  notionalValue: number; // Peak notional value (peak quantity × entry price)
+  peakNotionalValue: number; // Peak USD exposure (same as notionalValue for consistency)
+  collateralUsed?: number; // Peak collateral requirement (peak notional / leverage)
+  peakCollateralUsed?: number; // Peak margin requirement (same as collateralUsed for consistency)
+  exitNotionalValue?: number; // USD value at exit (if closed)
+  events: PerpTradeData[]; // All fills that belong to this trade
+}
+
 interface PerpTradingHistory {
   walletAddress: string;
   retrievalTime: string;
@@ -72,6 +99,7 @@ interface PerpTradingHistory {
   positions: PerpPositionData[];
   tradeHistory: PerpTradeData[];
   filledOrders: PerpTradeData[]; // Only filled orders with fees
+  trades: PerpTradeGroup[]; // Grouped trades showing complete position cycles
   fundingHistory: PerpFundingData[];
   depositWithdrawHistory: Array<{
     instrumentId: number;
@@ -86,6 +114,11 @@ interface PerpTradingHistory {
     netFunding: number;
     netPnL: number;
     activePositions: number;
+    completedTrades: number;
+    totalRealizedPnL: number;
+    winningTrades: number;
+    losingTrades: number;
+    winRate: number;
   };
 }
 
@@ -178,6 +211,10 @@ class PerpTradeHistoryRetriever {
     console.log('🔍 Parsing transaction logs for trading events...');
     const parsedData = await this.parseAllTransactionLogs(deriverseTransactions);
 
+    // Step 2.5: Group fills into logical trades
+    console.log('💼 Grouping fills into logical trades...');
+    const groupedTrades = this.groupFillsIntoTrades(parsedData.filledOrders);
+
     const result: PerpTradingHistory = {
       walletAddress,
       retrievalTime: new Date().toISOString(),
@@ -185,6 +222,7 @@ class PerpTradeHistoryRetriever {
       positions: [], // We could calculate positions from the history if needed
       tradeHistory: parsedData.trades,
       filledOrders: parsedData.filledOrders,
+      trades: groupedTrades,
       fundingHistory: parsedData.funding,
       depositWithdrawHistory: parsedData.depositsWithdraws,
       summary: {
@@ -193,7 +231,12 @@ class PerpTradeHistoryRetriever {
         totalRebates: 0,
         netFunding: 0,
         netPnL: 0,
-        activePositions: 0
+        activePositions: 0,
+        completedTrades: 0,
+        totalRealizedPnL: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        winRate: 0
       }
     };
 
@@ -225,6 +268,7 @@ class PerpTradeHistoryRetriever {
     console.log(`✅ Trade history retrieval complete!`);
     console.log(`   📈 Found ${result.tradeHistory.length} total events`);
     console.log(`   🔄 Found ${result.tradeHistory.filter(t => t.type === 'fill').length} trade executions`);
+    console.log(`   💼 Found ${result.trades.length} logical trades (${result.trades.filter(t => t.status === 'closed').length} closed, ${result.trades.filter(t => t.status === 'open').length} open)`);
     console.log(`   💰 Found ${result.fundingHistory.length} funding events`);
     console.log(`   🏦 Found ${result.depositWithdrawHistory.length} deposit/withdraw events`);
 
@@ -864,6 +908,271 @@ class PerpTradeHistoryRetriever {
     return null; // No leverage change found before this timestamp
   }
 
+  private groupFillsIntoTrades(filledOrders: PerpTradeData[]): PerpTradeGroup[] {
+    console.log(`\n💼 Grouping ${filledOrders.length} fills into trades...`);
+    
+    // Sort fills chronologically (oldest first) for proper position tracking
+    const sortedFills = [...filledOrders].sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Detect if we might be starting mid-position by analyzing first few fills
+    if (sortedFills.length > 0) {
+      const firstFill = sortedFills[0];
+      const instrumentFills = sortedFills.filter(f => f.instrumentId === firstFill.instrumentId).slice(0, 5);
+      let runningBalance = 0;
+      
+      for (const fill of instrumentFills) {
+        const positionChange = fill.side === 'long' ? fill.quantity : -fill.quantity;
+        runningBalance += positionChange;
+        
+        // If we see a closing fill without a prior opening, warn about missing data
+        if (Math.sign(positionChange) !== Math.sign(runningBalance) && runningBalance !== 0) {
+          console.log(`     ⚠️ Warning: First fill appears to be closing/reducing an existing position. Some trade data may be missing from before ${firstFill.timeString}`);
+          break;
+        }
+      }
+    }
+    
+    const trades: PerpTradeGroup[] = [];
+    const positionsByInstrument = new Map<number, {
+      balance: number; // Running position balance (+ for long, - for short)
+      openTrade: PerpTradeGroup | null; // Currently open trade for this instrument
+    }>();
+    
+    // Helper function to calculate weighted average price from fills
+    const calculateWeightedPrice = (fills: PerpTradeData[]): number => {
+      let totalNotional = 0;
+      let totalQuantity = 0;
+      
+      for (const fill of fills) {
+        totalNotional += fill.quantity * fill.price;
+        totalQuantity += fill.quantity;
+      }
+      
+      return totalQuantity > 0 ? totalNotional / totalQuantity : 0;
+    };
+    
+    // Helper to maintain separate lists for entry/exit calculations
+    const tradeCalculationData = new Map<string, {
+      entryFills: PerpTradeData[];
+      exitFills: PerpTradeData[];
+    }>();
+    
+    // Helper function to update trade with new fill
+    const updateTradeWithFill = (trade: PerpTradeGroup, fill: PerpTradeData, currentBalance: number) => {
+      // Initialize calculation data for this trade if needed
+      if (!tradeCalculationData.has(trade.tradeId)) {
+        tradeCalculationData.set(trade.tradeId, { entryFills: [], exitFills: [] });
+      }
+      const calcData = tradeCalculationData.get(trade.tradeId)!;
+      
+      // Add to events
+      trade.events.push(fill);
+      trade.totalFees += fill.fees;
+      trade.totalRebates += fill.rebates;
+      trade.netFees = trade.totalFees - trade.totalRebates;
+      
+      // Determine if this is an entry (increasing) or exit (decreasing) fill
+      const isIncreasing = fill.side === trade.direction;
+      
+      if (isIncreasing) {
+        // This fill increases the position
+        calcData.entryFills.push(fill);
+        
+        // Recalculate weighted entry price
+        trade.entryPrice = calculateWeightedPrice(calcData.entryFills);
+        
+        // Update peak position size if this is the largest
+        const newPositionSize = Math.abs(currentBalance);
+        if (newPositionSize > trade.peakQuantity) {
+          trade.peakQuantity = newPositionSize;
+          trade.quantity = newPositionSize; // quantity always shows peak
+          
+          // Recalculate peak values
+          trade.notionalValue = trade.peakQuantity * trade.entryPrice;
+          trade.peakNotionalValue = trade.notionalValue;
+          
+          if (trade.leverage && trade.leverage > 0) {
+            trade.collateralUsed = trade.notionalValue / trade.leverage;
+            trade.peakCollateralUsed = trade.collateralUsed;
+          }
+        }
+        
+        console.log(`     📈 Increasing ${trade.direction} position: ${trade.tradeId} (${Math.abs(currentBalance)} SOL, peak: ${trade.peakQuantity} SOL @ avg ${trade.entryPrice.toFixed(4)})`);
+      } else {
+        // This fill decreases the position (partial or full exit)
+        calcData.exitFills.push(fill);
+        
+        // Recalculate weighted exit price
+        if (calcData.exitFills.length > 0) {
+          trade.exitPrice = calculateWeightedPrice(calcData.exitFills);
+          trade.exitTime = fill.timeString;
+        }
+        
+        console.log(`     📉 Reducing ${trade.direction} position: ${trade.tradeId} (${Math.abs(currentBalance)} SOL remaining)`);
+      }
+    };
+    
+    // Helper function to close a trade
+    const closeTrade = (trade: PerpTradeGroup, exitFill: PerpTradeData) => {
+      // Get calculation data for this trade
+      const calcData = tradeCalculationData.get(trade.tradeId);
+      if (!calcData) {
+        tradeCalculationData.set(trade.tradeId, { entryFills: [], exitFills: [] });
+      }
+      const data = tradeCalculationData.get(trade.tradeId)!;
+      
+      // Add final exit fill
+      data.exitFills.push(exitFill);
+      trade.exitPrice = calculateWeightedPrice(data.exitFills);
+      trade.exitTime = exitFill.timeString;
+      trade.exitNotionalValue = trade.peakQuantity * (trade.exitPrice || 0);
+      trade.status = 'closed';
+      
+      // Calculate realized PnL based on peak quantity
+      if (trade.exitPrice) {
+        const direction = trade.direction === 'long' ? 1 : -1;
+        trade.realizedPnL = (trade.exitPrice - trade.entryPrice) * trade.peakQuantity * direction;
+        trade.realizedPnLPercent = (trade.realizedPnL / trade.notionalValue) * 100;
+      }
+      
+      console.log(`     🔴 Closing ${trade.direction} trade: ${trade.tradeId} | Peak: ${trade.peakQuantity} SOL | PnL: ${trade.realizedPnL?.toFixed(4)} USDC (${trade.realizedPnLPercent?.toFixed(2)}%)`);
+      return trade;
+    };
+    
+    // Helper function to create new trade
+    const createTrade = (fill: PerpTradeData, quantity: number, instrId: number): PerpTradeGroup => {
+      const tradeId = `T${Math.random().toString(36).substring(2, 11)}`;
+      
+      // Initialize calculation data for this trade
+      tradeCalculationData.set(tradeId, { entryFills: [fill], exitFills: [] });
+      
+      const newTrade: PerpTradeGroup = {
+        tradeId,
+        instrumentId: instrId,
+        asset: fill.asset || 'SOL',
+        market: fill.market || 'SOL/USDC',
+        direction: fill.side as 'long' | 'short',
+        status: 'open',
+        quantity: quantity, // Peak quantity (starts as initial quantity)
+        peakQuantity: quantity,
+        entryPrice: fill.price,
+        entryTime: fill.timeString,
+        totalFees: fill.fees,
+        totalRebates: fill.rebates,
+        netFees: fill.fees - fill.rebates,
+        leverage: fill.effectiveLeverage,
+        notionalValue: quantity * fill.price,
+        peakNotionalValue: quantity * fill.price,
+        events: [fill]
+      };
+      
+      // Calculate collateral if leverage is available
+      if (newTrade.leverage && newTrade.leverage > 0) {
+        newTrade.collateralUsed = newTrade.notionalValue / newTrade.leverage;
+        newTrade.peakCollateralUsed = newTrade.collateralUsed;
+      }
+      
+      console.log(`     🟢 Opening new ${fill.side} trade: ${tradeId} (${quantity} SOL @ ${fill.price})`);
+      return newTrade;
+    };
+    
+    for (const fill of sortedFills) {
+      const instrId = fill.instrumentId;
+      
+      // Initialize position tracking for this instrument if needed
+      if (!positionsByInstrument.has(instrId)) {
+        positionsByInstrument.set(instrId, { balance: 0, openTrade: null });
+      }
+      
+      const position = positionsByInstrument.get(instrId)!;
+      const previousBalance = position.balance;
+      
+      // Calculate position change (+quantity for long, -quantity for short)
+      const positionChange = fill.side === 'long' ? fill.quantity : -fill.quantity;
+      const newBalance = previousBalance + positionChange;
+      
+      console.log(`   📊 Fill ${fill.orderId}: ${fill.side} ${fill.quantity} @ ${fill.price} | Balance: ${previousBalance} → ${newBalance}`);
+      
+      // Check if this fill causes a position direction change (crosses zero)
+      const crossesZero = Math.sign(previousBalance) !== Math.sign(newBalance) && previousBalance !== 0 && newBalance !== 0;
+      const goesToZero = previousBalance !== 0 && newBalance === 0;
+      const comesFromZero = previousBalance === 0 && newBalance !== 0;
+      
+      if (comesFromZero) {
+        // Opening new position from zero
+        const newTrade = createTrade(fill, Math.abs(newBalance), instrId);
+        position.openTrade = newTrade;
+        trades.push(newTrade); // Add to trades array immediately
+        
+      } else if (goesToZero && position.openTrade) {
+        // Closing position exactly to zero
+        const trade = position.openTrade;
+        updateTradeWithFill(trade, fill, newBalance); // Add the exit fill to the trade
+        const closedTrade = closeTrade(trade, fill);
+        position.openTrade = null;
+        
+      } else if (crossesZero && position.openTrade) {
+        // Position flip: close current trade and open new one
+        const currentTrade = position.openTrade;
+        
+        // Calculate how much closes current position and how much opens new position
+        const closeQuantity = Math.abs(previousBalance);
+        const openQuantity = Math.abs(newBalance);
+        
+        console.log(`     ↩️ Position flip: closing ${closeQuantity} ${currentTrade.direction} + opening ${openQuantity} ${fill.side}`);
+        
+        // Close current trade (add proportional fees for closing portion)
+        currentTrade.totalFees += fill.fees * (closeQuantity / fill.quantity);
+        currentTrade.totalRebates += fill.rebates * (closeQuantity / fill.quantity);
+        currentTrade.netFees = currentTrade.totalFees - currentTrade.totalRebates;
+        
+        const closedTrade = closeTrade(currentTrade, fill);
+        trades.push(closedTrade);
+        
+        // Open new trade in opposite direction (proportional fees for opening portion)
+        const newTrade = createTrade(fill, openQuantity, instrId);
+        newTrade.totalFees = fill.fees * (openQuantity / fill.quantity);
+        newTrade.totalRebates = fill.rebates * (openQuantity / fill.quantity);
+        newTrade.netFees = newTrade.totalFees - newTrade.totalRebates;
+        newTrade.notionalValue = openQuantity * fill.price;
+        newTrade.peakNotionalValue = newTrade.notionalValue;
+        
+        if (newTrade.leverage && newTrade.leverage > 0) {
+          newTrade.collateralUsed = newTrade.notionalValue / newTrade.leverage;
+          newTrade.peakCollateralUsed = newTrade.collateralUsed;
+        }
+        
+        position.openTrade = newTrade;
+        trades.push(newTrade); // Add to trades array immediately
+        
+      } else if (position.openTrade) {
+        // Adding to or reducing existing position
+        const trade = position.openTrade;
+        updateTradeWithFill(trade, fill, newBalance);
+      }
+      
+      // Update position balance
+      position.balance = newBalance;
+    }
+    
+    // Log any remaining open trades (already in trades array)
+    for (const [, position] of positionsByInstrument) {
+      if (position.openTrade) {
+        console.log(`     ⚠️ Open trade remains: ${position.openTrade.tradeId} (${position.openTrade.direction} ${Math.abs(position.balance)} SOL)`);
+      }
+    }
+    
+    // Validate trade data
+    const closedTrades = trades.filter(t => t.status === 'closed');
+    const missingExitData = closedTrades.filter(t => !t.exitPrice);
+    if (missingExitData.length > 0) {
+      console.log(`     ⚠️ Warning: ${missingExitData.length} closed trades missing exit data`);
+    }
+    
+    console.log(`✅ Created ${trades.length} trades (${closedTrades.length} closed, ${trades.filter(t => t.status === 'open').length} open)`);
+    return trades;
+  }
+
   private async enhanceFillsWithLeverage(fills: PerpTradeData[], placeOrders: PerpTradeData[], txSignature: string): Promise<void> {
     console.log(`   ⚙️ Enhancing ${fills.length} fills with leverage data from ${placeOrders.length} place orders`);
 
@@ -932,15 +1241,23 @@ class PerpTradeHistoryRetriever {
   }
 
   private calculateSummary(history: PerpTradingHistory): PerpTradingHistory['summary'] {
-    const trades = history.tradeHistory.filter(t => t.type === 'fill');
+    const fills = history.tradeHistory.filter(t => t.type === 'fill');
+    const closedTrades = history.trades.filter(t => t.status === 'closed');
+    const winningTrades = closedTrades.filter(t => (t.realizedPnL || 0) > 0);
+    const losingTrades = closedTrades.filter(t => (t.realizedPnL || 0) < 0);
 
     return {
-      totalTrades: trades.length,
-      totalFees: history.positions.reduce((sum, pos) => sum + pos.fees, 0),
-      totalRebates: history.positions.reduce((sum, pos) => sum + pos.rebates, 0),
-      netFunding: history.positions.reduce((sum, pos) => sum + pos.fundingPayments, 0),
+      totalTrades: fills.length,
+      totalFees: history.filledOrders.reduce((sum, fill) => sum + fill.fees, 0),
+      totalRebates: history.filledOrders.reduce((sum, fill) => sum + fill.rebates, 0),
+      netFunding: history.fundingHistory.reduce((sum, funding) => sum + funding.fundingAmount, 0),
       netPnL: history.positions.reduce((sum, pos) => sum + pos.realizedPnL, 0),
-      activePositions: history.positions.filter(pos => pos.currentPerps !== 0).length
+      activePositions: history.positions.filter(pos => pos.currentPerps !== 0).length,
+      completedTrades: closedTrades.length,
+      totalRealizedPnL: closedTrades.reduce((sum, trade) => sum + (trade.realizedPnL || 0), 0),
+      winningTrades: winningTrades.length,
+      losingTrades: losingTrades.length,
+      winRate: closedTrades.length > 0 ? (winningTrades.length / closedTrades.length) * 100 : 0
     };
   }
 
@@ -1004,13 +1321,47 @@ async function main() {
     console.log('\n=== PERPETUAL TRADING SUMMARY ===');
     console.log(`Wallet: ${history.walletAddress}`);
     console.log(`Network: devnet`);
-    console.log(`Total Trades: ${history.summary.totalTrades}`);
+    console.log(`Total Fill Events: ${history.summary.totalTrades}`);
+    console.log(`Completed Trades: ${history.summary.completedTrades}`);
+    console.log(`Win Rate: ${history.summary.winRate.toFixed(1)}% (${history.summary.winningTrades}W/${history.summary.losingTrades}L)`);
+    console.log(`Total Realized PnL: ${history.summary.totalRealizedPnL.toFixed(4)} USDC`);
     console.log(`Active Positions: ${history.summary.activePositions}`);
-    console.log(`Total Fees: ${history.summary.totalFees}`);
-    console.log(`Total Rebates: ${history.summary.totalRebates}`);
-    console.log(`Net Funding: ${history.summary.netFunding}`);
-    console.log(`Net PnL: ${history.summary.netPnL}`);
+    console.log(`Total Fees: ${history.summary.totalFees.toFixed(4)} USDC`);
+    console.log(`Total Rebates: ${history.summary.totalRebates.toFixed(4)} USDC`);
+    console.log(`Net Funding: ${history.summary.netFunding.toFixed(4)}`);
     console.log(`Instruments Traded: ${history.positions.length}`);
+
+    // Show detailed trade information for closed trades
+    const closedTrades = history.trades.filter(t => t.status === 'closed');
+    if (closedTrades.length > 0) {
+      console.log('\n=== RECENT TRADES ===');
+      
+      // Sort by entry time (most recent first) and show last 5 trades
+      const recentTrades = closedTrades
+        .sort((a, b) => new Date(b.entryTime).getTime() - new Date(a.entryTime).getTime())
+        .slice(0, 5);
+      
+      for (const trade of recentTrades) {
+        const entryTime = new Date(trade.entryTime).toLocaleString();
+        const exitTime = trade.exitTime ? new Date(trade.exitTime).toLocaleString() : 'N/A';
+        const duration = trade.exitTime ? 
+          Math.round((new Date(trade.exitTime).getTime() - new Date(trade.entryTime).getTime()) / 60000) : 0;
+        
+        const pnlColor = (trade.realizedPnL || 0) >= 0 ? '🟢' : '🔴';
+        const directionEmoji = trade.direction === 'long' ? '📈' : '📉';
+        
+        console.log(`${directionEmoji} ${trade.direction.toUpperCase()} ${trade.peakQuantity} SOL`);
+        console.log(`   Entry: ${entryTime} @ $${trade.entryPrice.toFixed(4)}`);
+        console.log(`   Exit:  ${exitTime} @ $${(trade.exitPrice || 0).toFixed(4)} (${duration}min)`);
+        console.log(`   Peak Notional: $${trade.peakNotionalValue.toFixed(2)} | Fees: $${trade.netFees.toFixed(4)}`);
+        console.log(`   ${pnlColor} PnL: ${trade.realizedPnL?.toFixed(4)} USDC (${trade.realizedPnLPercent?.toFixed(2)}%)`);
+        console.log('');
+      }
+      
+      if (closedTrades.length > 5) {
+        console.log(`... and ${closedTrades.length - 5} more completed trades`);
+      }
+    }
 
     // Export to file
     const filepath = await retriever.exportToFile(history);
