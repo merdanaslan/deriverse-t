@@ -15,6 +15,29 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
+const loadDotEnv = (envPath = path.join(process.cwd(), '.env')): void => {
+  try {
+    if (!fs.existsSync(envPath)) return;
+    const contents = fs.readFileSync(envPath, 'utf8');
+    for (const rawLine of contents.split('\n')) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIndex = line.indexOf('=');
+      if (eqIndex === -1) continue;
+      const key = line.slice(0, eqIndex).trim();
+      let value = line.slice(eqIndex + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (!process.env[key]) {
+        process.env[key] = value;
+      }
+    }
+  } catch (error) {
+    console.log(`⚠️ Failed to load .env: ${error}`);
+  }
+};
+
 // Types for our trade history data
 interface PerpTradeData {
   tradeId: string;
@@ -31,6 +54,7 @@ interface PerpTradeData {
   rebates: number;
   leverage?: number;
   orderId: bigint;
+  role?: 'taker' | 'maker';
   type: 'fill' | 'place' | 'cancel' | 'liquidate' | 'fee' | 'leverage_change' | 'soc_loss' | 'revoke' | 'mass_cancel' | 'new_order';
   rawEvent?: any; // Full SDK event object
   // Enhanced fields for fills
@@ -92,6 +116,28 @@ interface PerpTradeGroup {
   events: PerpTradeData[]; // All fills that belong to this trade
 }
 
+interface CapturedLogRecord {
+  signature: string;
+  blockTime: number;
+  logs: string[];
+  isUserSigner: boolean;
+}
+
+interface ProgramScanCheckpoint {
+  walletAddress: string;
+  programId: string;
+  latestSignature: string;
+  latestBlockTime?: number;
+  updatedAt: string;
+}
+
+interface UiOrder {
+  action: string;
+  price: number;
+  amount: number;
+  datetime: string; // "YYYY-MM-DD HH:mm:ss" from UI
+}
+
 interface PerpTradingHistory {
   walletAddress: string;
   retrievalTime: string;
@@ -125,9 +171,13 @@ interface PerpTradingHistory {
 class PerpTradeHistoryRetriever {
   private engine: Engine;
   private connection: Connection;
+  private rpcUrl: string;
+  private batchGetTransactionSupported: boolean | null = null;
   private startDate: Date;
   private endDate: Date;
   private leverageTimeline: Map<number, Array<{timestamp: number, leverage: number}>> = new Map();
+  private userClientId?: number;
+  private clientPDA?: string;
 
   constructor(rpcUrl: string = 'https://api.devnet.solana.com', startDate?: Date, endDate?: Date) {
     const rpc = createSolanaRpc(rpcUrl);
@@ -138,13 +188,56 @@ class PerpTradeHistoryRetriever {
       version: VERSION,
       commitment: 'confirmed'
     });
+    // Guard against partial initialize failures: logsDecode expects these maps to exist.
+    const engineAny = this.engine as any;
+    if (!engineAny.tokens) {
+      engineAny.tokens = new Map();
+    }
+    if (!engineAny.instruments) {
+      engineAny.instruments = new Map();
+    }
     this.connection = new Connection(rpcUrl, 'confirmed');
+    this.rpcUrl = rpcUrl;
     // Use provided date range or throw error if not provided
     if (!startDate || !endDate) {
       throw new Error('Start date and end date are required');
     }
     this.startDate = startDate;
     this.endDate = endDate;
+  }
+
+  private deriveClientPrimaryPDA(walletAddress: string): PublicKey {
+    const tagBuf = Buffer.alloc(8);
+    tagBuf.writeUint32LE(1, 0);  // version
+    tagBuf.writeUint32LE(31, 4); // CLIENT_PRIMARY tag
+    const [pda] = PublicKey.findProgramAddressSync(
+      [tagBuf, new PublicKey(walletAddress).toBytes()],
+      new PublicKey(this.engine.programId.toString())
+    );
+    return pda;
+  }
+
+  private async resolveUserClientId(walletAddress: string, retries = 4): Promise<number | undefined> {
+    for (let i = 0; i < retries; i++) {
+      try {
+        await this.engine.setSigner(walletAddress as Address);
+        const clientData = await this.engine.getClientData();
+        for (const [, perpData] of clientData.perp) {
+          return perpData.clientId;
+        }
+        return undefined;
+      } catch (error: any) {
+        const message = String(error?.message || error);
+        const isRateLimit = message.includes('429') || message.includes('Too Many Requests');
+        if (!isRateLimit || i === retries - 1) {
+          return undefined;
+        }
+        const delay = 600 * (i + 1);
+        console.log(`   ⏳ Rate limited while resolving clientId; retrying in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    return undefined;
   }
 
   async initialize(): Promise<void> {
@@ -156,19 +249,23 @@ class PerpTradeHistoryRetriever {
       // Add debugging info about the engine state
       console.log(`📊 Engine version: ${this.engine.version}`);
       console.log(`🎯 Program ID: ${this.engine.programId}`);
-      console.log(`🌐 Connected instruments: ${this.engine.instruments.size}`);
-      console.log(`💰 Connected tokens: ${this.engine.tokens.size}`);
+      console.log(`🌐 Connected instruments: ${this.engine.instruments?.size ?? 0}`);
+      console.log(`💰 Connected tokens: ${this.engine.tokens?.size ?? 0}`);
       
       // Debug instruments details
-      console.log('\n🔍 Exploring instruments:');
-      for (const [instrId, instrument] of this.engine.instruments) {
-        console.log(`   Instrument ${instrId}:`, instrument);
-      }
-      
-      // Debug tokens details
-      console.log('\n🔍 Exploring tokens:');
-      for (const [tokenId, token] of this.engine.tokens) {
-        console.log(`   Token ${tokenId}:`, token);
+      if (this.engine.instruments && this.engine.tokens) {
+        console.log('\n🔍 Exploring instruments:');
+        for (const [instrId, instrument] of this.engine.instruments) {
+          console.log(`   Instrument ${instrId}:`, instrument);
+        }
+        
+        // Debug tokens details
+        console.log('\n🔍 Exploring tokens:');
+        for (const [tokenId, token] of this.engine.tokens) {
+          console.log(`   Token ${tokenId}:`, token);
+        }
+      } else {
+        console.log('⚠️ Engine instruments/tokens not available (RPC may be unreachable).');
       }
 
     } catch (error: any) {
@@ -185,7 +282,15 @@ class PerpTradeHistoryRetriever {
     }
   }
 
-  async fetchPerpTradeHistory(walletAddress: string): Promise<PerpTradingHistory> {
+  async fetchPerpTradeHistory(
+    walletAddress: string,
+    options?: {
+      logFilePath?: string;
+      includeProgramScan?: boolean;
+      programScanCheckpointPath?: string;
+      disableProgramScanCheckpoint?: boolean;
+    }
+  ): Promise<PerpTradingHistory> {
     console.log(`\n📅 Date Range: ${this.startDate.toLocaleDateString()} to ${this.endDate.toLocaleDateString()}`);
     console.log(`Fetching perpetual trade history for wallet: ${walletAddress}`);
 
@@ -196,9 +301,64 @@ class PerpTradeHistoryRetriever {
       throw new Error(`Invalid wallet address: ${walletAddress}`);
     }
 
+    // Derive Client Primary PDA for fetching all transactions (taker + maker)
+    const clientPDA = this.deriveClientPrimaryPDA(walletAddress);
+    this.clientPDA = clientPDA.toString();
+    console.log(`🔑 Client Primary PDA: ${this.clientPDA}`);
+
+    // Get user's clientId for filtering maker fills
+    try {
+      this.userClientId = await this.resolveUserClientId(walletAddress);
+      if (this.userClientId !== undefined) {
+        console.log(`🆔 User clientId: ${this.userClientId}`);
+      } else {
+        console.log('⚠️ Could not resolve user clientId from engine; will try transaction inference.');
+      }
+    } catch (error) {
+      console.log('⚠️ Could not get clientId from engine, maker fill filtering may be limited');
+    }
+
     // Step 1: Get wallet's transaction history
     console.log('📜 Fetching wallet transaction history...');
-    const deriverseTransactions = await this.getWalletDeriverseTransactions(walletAddress);
+    let deriverseTransactions = await this.getWalletDeriverseTransactions(walletAddress);
+
+    // Fallback: infer clientId from user-signed tx logs when engine client fetch fails.
+    if (this.userClientId === undefined) {
+      const inferredClientId = this.inferUserClientIdFromTransactions(deriverseTransactions);
+      if (inferredClientId !== undefined) {
+        this.userClientId = inferredClientId;
+        console.log(`🆔 Inferred user clientId from transactions: ${this.userClientId}`);
+      }
+    }
+
+    const shouldProgramScan = options?.includeProgramScan ?? true;
+    if (shouldProgramScan) {
+      if (this.userClientId === undefined) {
+        console.log('⚠️ userClientId unavailable; maker-fill filtering is limited and may miss maker-only records.');
+      }
+      const programScanTxs = await this.getProgramTransactionsViaRpcScan(walletAddress, {
+        checkpointPath: options?.programScanCheckpointPath,
+        useCheckpoint: !options?.disableProgramScanCheckpoint
+      });
+      if (programScanTxs.length > 0) {
+        console.log(`⚡ Program scan returned ${programScanTxs.length} candidate transactions`);
+        deriverseTransactions = this.mergeTransactions(deriverseTransactions, programScanTxs);
+        console.log(`🔗 Merged transactions: ${deriverseTransactions.length} total after de-duplication`);
+      } else {
+        console.log(`ℹ️ Program scan returned 0 transactions in range`);
+      }
+    }
+
+    if (options?.logFilePath) {
+      const logTransactions = await this.loadCapturedLogs(options.logFilePath);
+      if (logTransactions.length > 0) {
+        console.log(`📥 Loaded ${logTransactions.length} transactions from log capture: ${options.logFilePath}`);
+        deriverseTransactions = this.mergeTransactions(deriverseTransactions, logTransactions);
+        console.log(`🔗 Merged transactions: ${deriverseTransactions.length} total after de-duplication`);
+      } else {
+        console.log(`ℹ️ No log capture entries found at: ${options.logFilePath}`);
+      }
+    }
 
     if (deriverseTransactions.length === 0) {
       console.log('❌ No Deriverse transactions found for this wallet');
@@ -319,6 +479,86 @@ class PerpTradeHistoryRetriever {
     throw new Error(`Failed to fetch tx ${signature} after ${retries} retries`);
   }
 
+  private async fetchTransactionsBatch(signatures: string[], retries = 8): Promise<Array<any | null>> {
+    if (signatures.length === 0) {
+      return [];
+    }
+    const fetchIndividually = async (): Promise<Array<any | null>> => {
+      const settled = await Promise.allSettled(
+        signatures.map(signature => this.fetchTransactionWithRetry(signature))
+      );
+      return settled.map(result => (result.status === 'fulfilled' ? result.value : null));
+    };
+    if (this.batchGetTransactionSupported === false) {
+      return fetchIndividually();
+    }
+
+    for (let i = 0; i < retries; i++) {
+      try {
+        const payload = signatures.map((signature, idx) => ({
+          jsonrpc: '2.0',
+          id: idx,
+          method: 'getTransaction',
+          params: [
+            signature,
+            {
+              commitment: 'confirmed',
+              maxSupportedTransactionVersion: 0
+            }
+          ]
+        }));
+
+        const response = await fetch(this.rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          if (response.status === 403 || response.status === 400) {
+            this.batchGetTransactionSupported = false;
+            console.log('   ℹ️ RPC batch getTransaction is unavailable on this endpoint, falling back to individual fetch.');
+            return fetchIndividually();
+          }
+          if (response.status === 429) {
+            this.batchGetTransactionSupported = false;
+            return fetchIndividually();
+          }
+          throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+
+        const json = await response.json();
+        if (!Array.isArray(json)) {
+          this.batchGetTransactionSupported = false;
+          console.log('   ℹ️ RPC batch response format unsupported, falling back to individual fetch.');
+          return fetchIndividually();
+        }
+        this.batchGetTransactionSupported = true;
+        const results = json;
+        const byId = new Map<number, any>();
+        for (const item of results) {
+          if (typeof item?.id === 'number') {
+            byId.set(item.id, item.result || null);
+          }
+        }
+        return signatures.map((_, idx) => byId.get(idx) ?? null);
+      } catch (error: any) {
+        const message = String(error?.message || error);
+        if (message.includes('403') || message.includes('400')) {
+          this.batchGetTransactionSupported = false;
+          return fetchIndividually();
+        }
+        if (message.includes('429') || message.includes('Too Many Requests')) {
+          this.batchGetTransactionSupported = false;
+          return fetchIndividually();
+        }
+        throw error;
+      }
+    }
+    this.batchGetTransactionSupported = false;
+    return fetchIndividually();
+  }
+
   private async getSignaturesWithRetry(address: PublicKey, options: any, retries = 10): Promise<any[]> {
     for (let i = 0; i < retries; i++) {
       try {
@@ -336,7 +576,7 @@ class PerpTradeHistoryRetriever {
     throw new Error(`Failed to fetch signatures after ${retries} retries`);
   }
 
-  private async getWalletDeriverseTransactions(walletAddress: string): Promise<Array<{ signature: string; blockTime: number; logs: string[] }>> {
+  private async getWalletDeriverseTransactions(walletAddress: string): Promise<Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>> {
     console.log(`Fetching Deriverse transactions for wallet...`);
 
     try {
@@ -344,72 +584,79 @@ class PerpTradeHistoryRetriever {
       const startTimestamp = Math.floor(this.startDate.getTime() / 1000);
       const endTimestamp = Math.floor(this.endDate.getTime() / 1000);
 
-      // Get transaction signatures for this wallet with pagination
-      const allSignatures = [];
-      let beforeSignature: string | undefined = undefined;
-      let hasMore = true;
-      let pageCount = 0;
+      // Query both client PDA and wallet address to avoid missing taker txs when PDA is absent in account keys.
+      const addressesToQuery = Array.from(new Set([this.clientPDA, walletAddress].filter(Boolean) as string[]));
+      const allSignaturesMap = new Map<string, any>();
 
-      console.log(`   Fetching signatures (paginated)...`);
+      for (const address of addressesToQuery) {
+        const label = address === walletAddress ? 'wallet' : 'client PDA';
+        console.log(`   Using address for signature fetch: ${address} (${label})`);
+        console.log(`   Fetching signatures (paginated)...`);
 
-      while (hasMore) {
-        pageCount++;
-        const options: any = { limit: 1000 };
-        if (beforeSignature) {
-          options.before = beforeSignature;
-        }
+        let beforeSignature: string | undefined = undefined;
+        let hasMore = true;
+        let pageCount = 0;
 
-        const signatures = await this.getSignaturesWithRetry(
-          new PublicKey(walletAddress),
-          options
-        );
+        while (hasMore) {
+          pageCount++;
+          const options: any = { limit: 1000 };
+          if (beforeSignature) {
+            options.before = beforeSignature;
+          }
 
-        if (signatures.length === 0) {
-          hasMore = false;
-          break;
-        }
+          const signatures = await this.getSignaturesWithRetry(
+            new PublicKey(address),
+            options
+          );
 
-        console.log(`   Page ${pageCount}: Found ${signatures.length} signatures`);
-
-        // Check if any signatures are before our date range
-        let hitDateLimit = false;
-        for (const sig of signatures) {
-          if (sig.blockTime && sig.blockTime < startTimestamp) {
-            hitDateLimit = true;
+          if (signatures.length === 0) {
+            hasMore = false;
             break;
           }
-          allSignatures.push(sig);
-        }
 
-        if (hitDateLimit) {
-          console.log(`   Reached start of date range, stopping pagination`);
-          hasMore = false;
-        } else if (signatures.length < 1000) {
-          // Got fewer than 1000, means we've reached the end
-          hasMore = false;
-        } else {
-          // Prepare for next page
-          beforeSignature = signatures[signatures.length - 1].signature;
+          console.log(`   ${label} page ${pageCount}: Found ${signatures.length} signatures`);
+
+          // Check if any signatures are before our date range
+          let hitDateLimit = false;
+          for (const sig of signatures) {
+            if (sig.blockTime && sig.blockTime < startTimestamp) {
+              hitDateLimit = true;
+              break;
+            }
+            if (sig.blockTime && sig.blockTime > endTimestamp) {
+              continue;
+            }
+            allSignaturesMap.set(sig.signature, sig);
+          }
+
+          if (hitDateLimit) {
+            console.log(`   Reached start of date range for ${label}, stopping pagination`);
+            hasMore = false;
+          } else if (signatures.length < 1000) {
+            // Got fewer than 1000, means we've reached the end
+            hasMore = false;
+          } else {
+            // Prepare for next page
+            beforeSignature = signatures[signatures.length - 1].signature;
+          }
         }
       }
 
-      console.log(`Found ${allSignatures.length} total transactions for wallet across ${pageCount} pages`);
+      const allSignatures = Array.from(allSignaturesMap.values()).sort((a, b) => (b.blockTime || 0) - (a.blockTime || 0));
+      console.log(`Found ${allSignatures.length} total candidate transactions in date range`);
 
-      const deriverseTransactions: Array<{ signature: string; blockTime: number; logs: string[] }> = [];
+      const deriverseTransactions: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }> = [];
 
       // Process transactions in batches to avoid rate limits
-      const batchSize = 5;
+      const batchSize = 20;
       for (let i = 0; i < allSignatures.length; i += batchSize) {
         const batch = allSignatures.slice(i, i + batchSize);
 
-        const transactions = await Promise.allSettled(
-          batch.map(sig => this.fetchTransactionWithRetry(sig.signature))
-        );
+        const transactions = await this.fetchTransactionsBatch(batch.map(sig => sig.signature));
 
         for (let j = 0; j < transactions.length; j++) {
-          const result = transactions[j];
-          if (result.status === 'fulfilled' && result.value) {
-            const tx = result.value;
+          const tx = transactions[j];
+          if (tx) {
             const blockTime = tx.blockTime || 0;
 
             // Filter by date range
@@ -426,33 +673,40 @@ class PerpTradeHistoryRetriever {
             // Handle both legacy and versioned transactions
             if ('accountKeys' in tx.transaction.message) {
               // Legacy transaction
-              accountKeys = tx.transaction.message.accountKeys.map(key => key.toString());
+              accountKeys = tx.transaction.message.accountKeys.map((key: any) => key.toString());
               involvesDeriverse = accountKeys.includes(programId);
             } else {
               // Versioned transaction
-              accountKeys = tx.transaction.message.staticAccountKeys?.map(key => key.toString()) || [];
+              accountKeys = tx.transaction.message.staticAccountKeys?.map((key: any) => key.toString()) || [];
               involvesDeriverse = accountKeys.includes(programId);
             }
 
             if (!involvesDeriverse) {
-              console.log(`   ⚠️ Skipping tx ${tx.transaction.signatures[0].slice(0, 8)}: Does not involve Deriverse program`);
+              continue;
             }
+
+            // Determine if the user was the signer of this transaction
+            const numSigners = tx.transaction.message.header?.numRequiredSignatures || 1;
+            const signerKeys = accountKeys.slice(0, numSigners);
+            const isUserSigner = signerKeys.includes(walletAddress);
 
             // Debug: Log programs involved in first few transactions
             if (i === 0 && j < 3) {
-              const programs = accountKeys.filter(key => key.includes('Program') || key.length === 44);
+              const programs = accountKeys.filter((key: string) => key.includes('Program') || key.length === 44);
               console.log(`   🔍 Transaction ${batch[j].signature.slice(0, 8)} involves programs:`, programs.slice(0, 5));
             }
 
-            if (involvesDeriverse && tx.meta?.logMessages) {
+            if (tx.meta?.logMessages) {
+              if (!isUserSigner) {
+                console.log(`   🔄 Maker transaction detected: ${batch[j].signature.slice(0, 8)} (signed by someone else)`);
+              }
               deriverseTransactions.push({
-                signature: batch[j].signature,
+                signature: tx.transaction.signatures?.[0] || batch[j].signature,
                 blockTime: blockTime,
-                logs: tx.meta.logMessages
+                logs: tx.meta.logMessages,
+                isUserSigner
               });
             }
-          } else if (result.status === 'rejected') {
-            console.log(`   ❌ Failed to fetch tx ${batch[j].signature.slice(0, 8)}: ${result.reason}`);
           }
         }
 
@@ -462,13 +716,402 @@ class PerpTradeHistoryRetriever {
         }
       }
 
-      console.log(`Found ${deriverseTransactions.length} Deriverse transactions in date range`);
+      const makerCount = deriverseTransactions.filter(t => !t.isUserSigner).length;
+      const takerCount = deriverseTransactions.filter(t => t.isUserSigner).length;
+      console.log(`Found ${deriverseTransactions.length} Deriverse transactions in date range (${takerCount} taker, ${makerCount} maker)`);
       return deriverseTransactions;
 
     } catch (error) {
       console.warn(`Error fetching transactions: ${error}`);
       return [];
     }
+  }
+
+  private inferUserClientIdFromTransactions(
+    transactions: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>
+  ): number | undefined {
+    const counts = new Map<number, number>();
+    for (const tx of transactions) {
+      if (!tx.isUserSigner) {
+        continue;
+      }
+      try {
+        const decodedLogs = this.engine.logsDecode(tx.logs);
+        for (const log of decodedLogs) {
+          const logAny = log as any;
+          const candidate = logAny.clientId;
+          if (candidate !== undefined) {
+            const clientId = Number(candidate);
+            if (!Number.isNaN(clientId)) {
+              counts.set(clientId, (counts.get(clientId) || 0) + 1);
+            }
+          }
+        }
+      } catch {
+        // Ignore decode failures for inference.
+      }
+    }
+    if (counts.size === 0) {
+      return undefined;
+    }
+    const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+    return sorted[0][0];
+  }
+
+  private async loadCapturedLogs(logFilePath: string): Promise<CapturedLogRecord[]> {
+    try {
+      if (!fs.existsSync(logFilePath)) {
+        return [];
+      }
+      const contents = await fs.promises.readFile(logFilePath, 'utf8');
+      const trimmed = contents.trim();
+      if (trimmed.startsWith('[')) {
+        const parsed = JSON.parse(trimmed) as CapturedLogRecord[];
+        return Array.isArray(parsed) ? parsed : [];
+      }
+      const lines = contents.split('\n').filter(Boolean);
+      const records: CapturedLogRecord[] = [];
+      for (const line of lines) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.signature && parsed?.logs && typeof parsed?.blockTime === 'number') {
+            records.push(parsed as CapturedLogRecord);
+          }
+        } catch {
+          // Skip malformed line
+        }
+      }
+      return records;
+    } catch (error) {
+      console.warn(`⚠️ Failed to read log file ${logFilePath}: ${error}`);
+      return [];
+    }
+  }
+
+  private mergeTransactions(
+    primary: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>,
+    secondary: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>
+  ): Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }> {
+    const map = new Map<string, { signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>();
+    for (const tx of primary) {
+      map.set(tx.signature, tx);
+    }
+    for (const tx of secondary) {
+      if (!map.has(tx.signature)) {
+        map.set(tx.signature, tx);
+      }
+    }
+    return Array.from(map.values());
+  }
+
+  private logBelongsToUser(log: any, isUserSigner: boolean): boolean {
+    if (isUserSigner) {
+      return true;
+    }
+    if (this.userClientId === undefined) {
+      return false;
+    }
+    const candidateIds = [
+      log?.clientId,
+      log?.refClientId,
+      log?.makerClientId,
+      log?.takerClientId,
+      log?.userClientId,
+      log?.ownerClientId,
+      log?.counterpartyClientId
+    ];
+    return candidateIds.some(id => id !== undefined && Number(id) === this.userClientId);
+  }
+
+  private getDefaultProgramScanCheckpointPath(walletAddress: string): string {
+    const safeWalletPrefix = walletAddress.slice(0, 8);
+    return path.join(process.cwd(), 'logs', 'checkpoints', `program-scan-${safeWalletPrefix}.json`);
+  }
+
+  private async readProgramScanCheckpoint(
+    checkpointPath: string,
+    walletAddress: string
+  ): Promise<ProgramScanCheckpoint | null> {
+    try {
+      if (!fs.existsSync(checkpointPath)) {
+        return null;
+      }
+      const raw = await fs.promises.readFile(checkpointPath, 'utf8');
+      const parsed = JSON.parse(raw) as ProgramScanCheckpoint;
+      if (!parsed?.latestSignature) {
+        return null;
+      }
+      if (parsed.walletAddress !== walletAddress) {
+        return null;
+      }
+      if (parsed.programId !== this.engine.programId.toString()) {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeProgramScanCheckpoint(checkpointPath: string, checkpoint: ProgramScanCheckpoint): Promise<void> {
+    await fs.promises.mkdir(path.dirname(checkpointPath), { recursive: true });
+    await fs.promises.writeFile(checkpointPath, JSON.stringify(checkpoint, null, 2));
+  }
+
+  private async getProgramTransactionsViaRpcScan(
+    walletAddress: string,
+    options?: { checkpointPath?: string; useCheckpoint?: boolean }
+  ): Promise<CapturedLogRecord[]> {
+    console.log(`🔎 Scanning Deriverse program transactions (free RPC mode)...`);
+
+    const records: CapturedLogRecord[] = [];
+    const startTimestamp = Math.floor(this.startDate.getTime() / 1000);
+    const endTimestamp = Math.floor(this.endDate.getTime() / 1000);
+    const nowTs = Math.floor(Date.now() / 1000);
+    const checkpointPath = options?.checkpointPath || this.getDefaultProgramScanCheckpointPath(walletAddress);
+    const canUseCheckpoint = (options?.useCheckpoint ?? true) && endTimestamp >= nowTs - 3600;
+    const checkpoint = canUseCheckpoint
+      ? await this.readProgramScanCheckpoint(checkpointPath, walletAddress)
+      : null;
+
+    if (checkpoint) {
+      console.log(`   ♻️ Using scan checkpoint at ${checkpoint.latestSignature.slice(0, 8)} (${checkpoint.updatedAt})`);
+    }
+
+    const programAddress = new PublicKey(this.engine.programId.toString());
+    const allSignatures: any[] = [];
+    let firstSeenSignature: string | undefined;
+    let firstSeenBlockTime: number | undefined;
+
+    let beforeSignature: string | undefined = undefined;
+    let hasMore = true;
+    let pageCount = 0;
+    const maxPages = 250;
+
+    while (hasMore) {
+      pageCount++;
+      if (pageCount > maxPages) {
+        console.log(`   ⚠️ Program scan page cap reached (${maxPages}); stopping early.`);
+        break;
+      }
+
+      const queryOptions: any = { limit: 1000 };
+      if (beforeSignature) {
+        queryOptions.before = beforeSignature;
+      }
+
+      const signatures = await this.getSignaturesWithRetry(programAddress, queryOptions);
+      if (signatures.length === 0) {
+        break;
+      }
+
+      if (!firstSeenSignature) {
+        firstSeenSignature = signatures[0]?.signature;
+        firstSeenBlockTime = signatures[0]?.blockTime;
+      }
+
+      console.log(`   Program page ${pageCount}: ${signatures.length} signatures`);
+
+      let hitDateLimit = false;
+      let hitCheckpoint = false;
+      for (const sig of signatures) {
+        if (checkpoint && sig.signature === checkpoint.latestSignature) {
+          hitCheckpoint = true;
+          break;
+        }
+        if (sig.blockTime && sig.blockTime < startTimestamp) {
+          hitDateLimit = true;
+          break;
+        }
+        if (sig.blockTime && sig.blockTime > endTimestamp) {
+          continue;
+        }
+        allSignatures.push(sig);
+      }
+
+      if (hitCheckpoint) {
+        console.log(`   ✅ Reached checkpoint boundary, stopping scan.`);
+        hasMore = false;
+      } else if (hitDateLimit || signatures.length < 1000) {
+        hasMore = false;
+      } else {
+        beforeSignature = signatures[signatures.length - 1].signature;
+      }
+
+      if (hasMore) {
+        await new Promise(resolve => setTimeout(resolve, 80));
+      }
+    }
+
+    console.log(`   Candidate program signatures in range: ${allSignatures.length}`);
+
+    // Free-tier endpoints are sensitive to bursty getTransaction traffic.
+    const batchSize = 2;
+    for (let i = 0; i < allSignatures.length; i += batchSize) {
+      const batch = allSignatures.slice(i, i + batchSize);
+      const transactions = await this.fetchTransactionsBatch(batch.map(sig => sig.signature));
+
+      for (let j = 0; j < transactions.length; j++) {
+        const tx = transactions[j];
+        if (!tx) {
+          continue;
+        }
+        if (!tx?.meta?.logMessages || !tx?.transaction) {
+          continue;
+        }
+        const blockTime = tx.blockTime || 0;
+        if (blockTime < startTimestamp || blockTime > endTimestamp) {
+          continue;
+        }
+        if (!this.transactionInvolvesProgram(tx)) {
+          continue;
+        }
+
+        const isUserSigner = this.isUserSignerInTransaction(tx, walletAddress);
+        let decodedLogs: any[] = [];
+        try {
+          decodedLogs = this.engine.logsDecode(tx.meta.logMessages);
+        } catch {
+          continue;
+        }
+        const belongsToUser = decodedLogs.some(log => this.logBelongsToUser(log as any, isUserSigner));
+        if (!isUserSigner && !belongsToUser) {
+          continue;
+        }
+
+        records.push({
+          signature: tx.transaction.signatures?.[0] || batch[j].signature,
+          blockTime,
+          logs: tx.meta.logMessages,
+          isUserSigner
+        });
+      }
+
+      if (i + batchSize < allSignatures.length) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }
+
+    if (canUseCheckpoint && firstSeenSignature) {
+      const newCheckpoint: ProgramScanCheckpoint = {
+        walletAddress,
+        programId: this.engine.programId.toString(),
+        latestSignature: firstSeenSignature,
+        latestBlockTime: firstSeenBlockTime,
+        updatedAt: new Date().toISOString()
+      };
+      await this.writeProgramScanCheckpoint(checkpointPath, newCheckpoint);
+      console.log(`   💾 Updated program scan checkpoint: ${checkpointPath}`);
+    }
+
+    return records;
+  }
+
+  private extractAccountKeys(tx: any): string[] {
+    const message = tx?.transaction?.message;
+    if (!message) return [];
+    if (message.accountKeys) {
+      return message.accountKeys.map((key: any) => key.toString());
+    }
+    if (message.staticAccountKeys) {
+      return message.staticAccountKeys.map((key: any) => key.toString());
+    }
+    return [];
+  }
+
+  private isUserSignerInTransaction(tx: any, walletAddress: string): boolean {
+    const accountKeys = this.extractAccountKeys(tx);
+    const numSigners = tx?.transaction?.message?.header?.numRequiredSignatures || 1;
+    const signerKeys = accountKeys.slice(0, numSigners);
+    return signerKeys.includes(walletAddress);
+  }
+
+  private transactionInvolvesProgram(tx: any): boolean {
+    const accountKeys = this.extractAccountKeys(tx);
+    const programId = this.engine.programId.toString();
+    return accountKeys.includes(programId);
+  }
+
+  private logMatchesClientId(decodedLogs: any[]): boolean {
+    if (this.userClientId === undefined) {
+      return false;
+    }
+    for (const logAny of decodedLogs) {
+      if (this.logBelongsToUser(logAny, false)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async startLogService(walletAddress: string, logFilePath: string): Promise<void> {
+    console.log(`🔔 Starting log service for wallet: ${walletAddress}`);
+    console.log(`📝 Writing matched transactions to: ${logFilePath}`);
+
+    await fs.promises.mkdir(path.dirname(logFilePath), { recursive: true });
+
+    // Resolve clientId for filtering (if possible)
+    try {
+      this.userClientId = await this.resolveUserClientId(walletAddress);
+      if (this.userClientId !== undefined) {
+        console.log(`🆔 User clientId: ${this.userClientId}`);
+      } else {
+        console.log('⚠️ Could not resolve user clientId from engine, log filtering may be broader');
+      }
+    } catch (error) {
+      console.log('⚠️ Could not get clientId from engine, log filtering may be broader');
+    }
+
+    const programKey = new PublicKey(this.engine.programId.toString());
+    const subscriptionId = this.connection.onLogs(
+      programKey,
+      async (logInfo) => {
+        if (logInfo.err) {
+          return;
+        }
+
+        try {
+          // Decode logs and filter to fills first (reduce noise)
+          const decodedLogs = this.engine.logsDecode(logInfo.logs);
+          const hasFill = decodedLogs.some(log => log instanceof PerpFillOrderReportModel);
+          if (!hasFill) {
+            return;
+          }
+
+          if (!this.logMatchesClientId(decodedLogs)) {
+            return;
+          }
+
+          // Fetch full transaction to get blockTime + signer info
+          const tx = await this.fetchTransactionWithRetry(logInfo.signature);
+          if (!tx?.meta?.logMessages) {
+            return;
+          }
+
+          if (!this.transactionInvolvesProgram(tx)) {
+            return;
+          }
+
+          const record: CapturedLogRecord = {
+            signature: logInfo.signature,
+            blockTime: tx.blockTime || Math.floor(Date.now() / 1000),
+            logs: tx.meta.logMessages,
+            isUserSigner: this.isUserSignerInTransaction(tx, walletAddress)
+          };
+
+          await fs.promises.appendFile(logFilePath, JSON.stringify(record) + '\n');
+
+          const roleLabel = record.isUserSigner ? 'TAKER' : 'MAKER';
+          console.log(`   ✅ Captured ${roleLabel} tx ${logInfo.signature.slice(0, 8)} @ ${new Date(record.blockTime * 1000).toISOString()}`);
+        } catch (error) {
+          console.log(`   ⚠️ Log capture error: ${error}`);
+        }
+      },
+      'confirmed'
+    );
+
+    console.log(`📡 Log subscription active (id: ${subscriptionId}). Press Ctrl+C to stop.`);
+    await new Promise(() => {});
   }
 
 
@@ -482,7 +1125,7 @@ class PerpTradeHistoryRetriever {
     return 'SOL/USDC';
   }
 
-  private async buildCompleteLeverageTimeline(transactions: Array<{ signature: string; blockTime: number; logs: string[] }>): Promise<void> {
+  private async buildCompleteLeverageTimeline(transactions: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>): Promise<void> {
     console.log(`🔧 Pre-scanning ${transactions.length} transactions for leverage changes...`);
     
     for (const tx of transactions) {
@@ -491,6 +1134,9 @@ class PerpTradeHistoryRetriever {
         
         for (const log of decodedLogs) {
           if (log instanceof PerpChangeLeverageReportModel) {
+            if (!this.logBelongsToUser(log as any, tx.isUserSigner)) {
+              continue;
+            }
             const blockTimeMs = tx.blockTime * 1000;
             
             // Add to leverage timeline
@@ -520,7 +1166,7 @@ class PerpTradeHistoryRetriever {
     }
   }
 
-  private async parseAllTransactionLogs(transactions: Array<{ signature: string; blockTime: number; logs: string[] }>): Promise<{
+  private async parseAllTransactionLogs(transactions: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }>): Promise<{
     trades: PerpTradeData[];
     filledOrders: PerpTradeData[];
     funding: PerpFundingData[];
@@ -570,14 +1216,27 @@ class PerpTradeHistoryRetriever {
 
         for (const log of decodedLogs) {
           const blockTimeMs = tx.blockTime * 1000; // Convert to milliseconds
+          const logAny = log as any;
+          const logBelongsToUser = this.logBelongsToUser(logAny, tx.isUserSigner);
 
           // Filter for perpetual-related events
           if (log instanceof PerpFillOrderReportModel) {
+            if (!logBelongsToUser) {
+              continue;
+            }
+
             const rawEvent = serializeSdkObject(log);
-            const logAny = log as any;
             const quantity = Math.abs(Number(log.perps)) / 1e9; // Convert to SOL (9 decimals)
             const price = Number(log.price);
             const instrumentId = logAny.instrId || 0;
+            const isMaker = !tx.isUserSigner;
+
+            // For maker fills, flip the side: the fill's side represents the taker's action
+            // so the maker is on the opposite side
+            const side = isMaker
+              ? (log.side === 0 ? 'long' : 'short')   // Flip for maker
+              : (log.side === 0 ? 'short' : 'long');   // Normal for taker
+
             const tradeData: PerpTradeData = {
               tradeId: `${tx.signature}-${log.orderId}`,
               timestamp: blockTimeMs,
@@ -585,25 +1244,26 @@ class PerpTradeHistoryRetriever {
               instrumentId: instrumentId,
               asset: this.getAssetFromInstrumentId(instrumentId),
               market: this.getMarketFromInstrumentId(instrumentId),
-              side: log.side === 0 ? 'short' : 'long', // 0 = Short, 1 = Long
+              side: side,
               quantity: quantity,
               notionalValue: quantity * price, // Total USD value of the trade
               price: price,
               fees: Number(logAny.fee || 0) / 1e6, // Convert from raw USDC value to decimal
               rebates: Number(log.rebates || 0) / 1e6, // Convert from raw USDC value to decimal
               orderId: BigInt(log.orderId),
+              role: isMaker ? 'maker' : 'taker',
               type: 'fill',
               rawEvent: rawEvent
             };
             result.trades.push(tradeData);
             result.filledOrders.push(tradeData);
             txFills.push(tradeData); // Add to local list for fee linking
-            console.log(`   📈 Found perp fill: ${log.side === 0 ? 'SHORT' : 'LONG'} ${Math.abs(Number(log.perps)) / 1e9} SOL @ ${log.price}`);
+            const roleLabel = isMaker ? 'MAKER' : 'TAKER';
+            console.log(`   📈 Found ${roleLabel} perp fill: ${side.toUpperCase()} ${quantity} SOL @ ${price}`);
           }
 
-          if (log instanceof PerpPlaceOrderReportModel) {
+          if (log instanceof PerpPlaceOrderReportModel && logBelongsToUser) {
             const rawEvent = serializeSdkObject(log);
-            const logAny = log as any;
             const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             const placeOrder: PerpTradeData = {
               tradeId: `${tx.signature}-${log.orderId}-place`,
@@ -627,9 +1287,8 @@ class PerpTradeHistoryRetriever {
             console.log(`   📝 Found order place: ${log.side === 0 ? 'SHORT' : 'LONG'} ${Math.abs(Number(log.perps)) / 1e9} @ ${Number(log.price)}`);
           }
 
-          if (log.constructor.name === 'PerpFeesReportModel') {
+          if (log.constructor.name === 'PerpFeesReportModel' && logBelongsToUser) {
             const rawEvent = serializeSdkObject(log);
-            const logAny = log as any;
 
             // Fees are often associated with the most recent fill/trade in the same transaction
             // We'll add it as a separate event type 'fee' but link it to the orderId if possible
@@ -657,7 +1316,7 @@ class PerpTradeHistoryRetriever {
             console.log(`   💸 Found perp fee: ${Number(logAny.fees) / 1e6} USDC`);
           }
 
-          if (log instanceof PerpOrderCancelReportModel) {
+          if (log instanceof PerpOrderCancelReportModel && logBelongsToUser) {
             const rawEvent = serializeSdkObject(log);
             const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             result.trades.push({
@@ -679,7 +1338,7 @@ class PerpTradeHistoryRetriever {
             console.log(`   ❌ Found order cancel: ${log.orderId}`);
           }
 
-          if (log.constructor.name === 'PerpLiquidateReportModel') {
+          if (log.constructor.name === 'PerpLiquidateReportModel' && tx.isUserSigner) {
             const rawEvent = serializeSdkObject(log);
             const logAny = log as any;
             result.trades.push({
@@ -701,7 +1360,7 @@ class PerpTradeHistoryRetriever {
             console.log(`   💧 Found liquidation: ${logAny.side === 0 ? 'SHORT' : 'LONG'} ${Math.abs(Number(logAny.perps))} @ ${Number(logAny.price)}`);
           }
 
-          if (log instanceof PerpFundingReportModel) {
+          if (log instanceof PerpFundingReportModel && logBelongsToUser) {
             const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             result.funding.push({
               instrumentId: log.instrId,
@@ -714,7 +1373,7 @@ class PerpTradeHistoryRetriever {
 
           // --- NEW HANDLERS FOR MISSING EVENTS ---
 
-          if (log instanceof PerpChangeLeverageReportModel) {
+          if (log instanceof PerpChangeLeverageReportModel && logBelongsToUser) {
             const rawEvent = serializeSdkObject(log);
 
             result.trades.push({
@@ -738,9 +1397,8 @@ class PerpTradeHistoryRetriever {
             console.log(`   ⚙️ Found leverage change: ${Number(log.leverage)}x for instrument ${log.instrId} at ${new Date(blockTimeMs).toISOString()}`);
           }
 
-          if (log.constructor.name === 'PerpSocLossReportModel') {
+          if (log.constructor.name === 'PerpSocLossReportModel' && logBelongsToUser) {
             const rawEvent = serializeSdkObject(log);
-            const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-socloss`,
               timestamp: blockTimeMs,
@@ -760,9 +1418,8 @@ class PerpTradeHistoryRetriever {
             console.log(`   📉 Found socialized loss: ${Number(logAny.socLoss) / 1e6} USDC`);
           }
 
-          if (log.constructor.name === 'PerpOrderRevokeReportModel') {
+          if (log.constructor.name === 'PerpOrderRevokeReportModel' && logBelongsToUser) {
             const rawEvent = serializeSdkObject(log);
-            const logAny = log as any;
             result.trades.push({
               tradeId: `${tx.signature}-${logAny.orderId}-revoke`,
               timestamp: blockTimeMs,
@@ -782,7 +1439,7 @@ class PerpTradeHistoryRetriever {
             console.log(`   🚫 Found order revoke: ${logAny.orderId}`);
           }
 
-          if (log.constructor.name === 'PerpMassCancelReportModel') {
+          if (log.constructor.name === 'PerpMassCancelReportModel' && tx.isUserSigner) {
             const rawEvent = serializeSdkObject(log);
             const logAny = log as any;
             result.trades.push({
@@ -804,7 +1461,7 @@ class PerpTradeHistoryRetriever {
             console.log(`   💥 Found mass cancel`);
           }
 
-          if (log.constructor.name === 'PerpNewOrderReportModel') {
+          if (log.constructor.name === 'PerpNewOrderReportModel' && tx.isUserSigner) {
             // This might be redundant with PlaceOrder, but capturing just in case
             const rawEvent = serializeSdkObject(log);
             const logAny = log as any;
@@ -826,7 +1483,7 @@ class PerpTradeHistoryRetriever {
             });
           }
 
-          if (log instanceof PerpDepositReportModel) {
+          if (log instanceof PerpDepositReportModel && tx.isUserSigner) {
             const logAny = log as any;
             result.depositsWithdraws.push({
               instrumentId: log.instrId,
@@ -837,7 +1494,7 @@ class PerpTradeHistoryRetriever {
             console.log(`   ⬇️ Found deposit: ${Number(logAny.quantity || logAny.qty || logAny.amount || 0) / 1e9} SOL for instrument ${log.instrId}`);
           }
 
-          if (log instanceof PerpWithdrawReportModel) {
+          if (log instanceof PerpWithdrawReportModel && tx.isUserSigner) {
             const logAny = log as any;
             result.depositsWithdraws.push({
               instrumentId: log.instrId,
@@ -1240,6 +1897,140 @@ class PerpTradeHistoryRetriever {
     }
   }
 
+  private formatDateTimeLocal(timestampMs: number): string {
+    const d = new Date(timestampMs);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  private formatDateTimeUtc(timestampMs: number): string {
+    const d = new Date(timestampMs);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  }
+
+  compareWithUiOrders(
+    uiOrdersPath: string,
+    fills: PerpTradeData[],
+    uiTimeZone: 'local' | 'utc' = 'local',
+    range?: { start?: Date; end?: Date }
+  ): void {
+    try {
+      if (!fs.existsSync(uiOrdersPath)) {
+        console.log(`⚠️ UI orders file not found: ${uiOrdersPath}`);
+        return;
+      }
+
+      const uiOrdersRaw = JSON.parse(fs.readFileSync(uiOrdersPath, 'utf8')) as UiOrder[];
+      const parseUiDate = (value: string): Date => {
+        if (uiTimeZone === 'utc') {
+          return new Date(value.replace(' ', 'T') + 'Z');
+        }
+        return new Date(value.replace(' ', 'T'));
+      };
+
+      let uiOrders: UiOrder[] = uiOrdersRaw.map(o => ({
+        action: o.action,
+        price: Number(o.price),
+        amount: Number(o.amount),
+        datetime: o.datetime
+      }));
+
+      if (range?.start || range?.end) {
+        uiOrders = uiOrders.filter(order => {
+          const dt = parseUiDate(order.datetime);
+          if (Number.isNaN(dt.getTime())) {
+            return false;
+          }
+          if (range.start && dt < range.start) {
+            return false;
+          }
+          if (range.end && dt > range.end) {
+            return false;
+          }
+          return true;
+        });
+      }
+
+      const formatFillToUi = (fill: PerpTradeData): UiOrder => {
+        const roleLabel = fill.role ? (fill.role === 'maker' ? 'Maker' : 'Taker') : 'Unknown';
+        const sideLabel = fill.side === 'long' ? 'Buy' : 'Sell';
+        const datetime = uiTimeZone === 'utc'
+          ? this.formatDateTimeUtc(fill.timestamp)
+          : this.formatDateTimeLocal(fill.timestamp);
+        return {
+          action: `${roleLabel} ${sideLabel}`,
+          price: fill.price,
+          amount: fill.quantity,
+          datetime
+        };
+      };
+
+      const normalizeKey = (o: UiOrder): string => {
+        const priceKey = Number(o.price).toFixed(2);
+        const amountKey = Number(o.amount).toFixed(2);
+        return `${o.action}|${priceKey}|${amountKey}|${o.datetime}`;
+      };
+
+      const uiMap = new Map<string, number>();
+      for (const o of uiOrders) {
+        const key = normalizeKey(o);
+        uiMap.set(key, (uiMap.get(key) || 0) + 1);
+      }
+
+      const fillMap = new Map<string, number>();
+      for (const fill of fills) {
+        const key = normalizeKey(formatFillToUi(fill));
+        fillMap.set(key, (fillMap.get(key) || 0) + 1);
+      }
+
+      const missing: UiOrder[] = [];
+      const extra: UiOrder[] = [];
+
+      for (const [key, count] of uiMap) {
+        const inFetched = fillMap.get(key) || 0;
+        if (inFetched < count) {
+          const [action, price, amount, datetime] = key.split('|');
+          for (let i = 0; i < count - inFetched; i++) {
+            missing.push({ action, price: Number(price), amount: Number(amount), datetime });
+          }
+        }
+      }
+
+      for (const [key, count] of fillMap) {
+        const inUi = uiMap.get(key) || 0;
+        if (inUi < count) {
+          const [action, price, amount, datetime] = key.split('|');
+          for (let i = 0; i < count - inUi; i++) {
+            extra.push({ action, price: Number(price), amount: Number(amount), datetime });
+          }
+        }
+      }
+
+      console.log(`\n🔎 UI comparison (${uiTimeZone} time):`);
+      if (range?.start || range?.end) {
+        console.log(`   Range: ${range.start?.toISOString() || '-∞'} → ${range.end?.toISOString() || '+∞'}`);
+      }
+      console.log(`   UI orders: ${uiOrders.length}`);
+      console.log(`   Fetched fills: ${fills.length}`);
+      console.log(`   Missing in fetched: ${missing.length}`);
+      console.log(`   Extra in fetched: ${extra.length}`);
+
+      const printSample = (label: string, orders: UiOrder[]) => {
+        if (orders.length === 0) return;
+        console.log(`   ${label} (showing up to 10):`);
+        orders.slice(0, 10).forEach(o => {
+          console.log(`     • ${o.action} ${o.amount} @ ${o.price} | ${o.datetime}`);
+        });
+      };
+
+      printSample('Missing', missing);
+      printSample('Extra', extra);
+    } catch (error) {
+      console.log(`⚠️ Failed to compare with UI orders: ${error}`);
+    }
+  }
+
   private calculateSummary(history: PerpTradingHistory): PerpTradingHistory['summary'] {
     const fills = history.tradeHistory.filter(t => t.type === 'fill');
     const closedTrades = history.trades.filter(t => t.status === 'closed');
@@ -1279,27 +2070,176 @@ class PerpTradeHistoryRetriever {
 
 // CLI Interface
 async function main() {
-  const walletAddress = process.argv[2];
-  const customRpc = process.argv[3];
+  loadDotEnv();
+
+  const args = process.argv.slice(2);
+  const walletAddress = args[0];
+  let customRpc: string | undefined;
+  let listen = false;
+  let logFilePath: string | undefined;
+  let compareUiPath: string | undefined;
+  let uiTimeZone: 'local' | 'utc' = 'utc';
+  let helius = false;
+  let heliusApiKey: string | undefined;
+  let heliusRpcUrl: string | undefined;
+  let startDateInput: string | undefined;
+  let endDateInput: string | undefined;
+  let includeProgramScan = true;
+  let useProgramScanCheckpoint = true;
+  let programScanCheckpointPath: string | undefined;
+
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--rpc') {
+      customRpc = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--start') {
+      startDateInput = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--end') {
+      endDateInput = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--listen') {
+      listen = true;
+      continue;
+    }
+    if (arg === '--log-file' || arg === '--include-logs') {
+      logFilePath = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--compare-ui') {
+      compareUiPath = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--ui-timezone') {
+      const tz = (args[i + 1] || '').toLowerCase();
+      if (tz === 'utc' || tz === 'local') {
+        uiTimeZone = tz as 'local' | 'utc';
+      } else {
+        console.log(`⚠️ Unknown ui-timezone "${args[i + 1]}", defaulting to utc`);
+      }
+      i++;
+      continue;
+    }
+    if (arg === '--helius') {
+      helius = true;
+      continue;
+    }
+    if (arg === '--helius-key') {
+      heliusApiKey = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--helius-rpc') {
+      heliusRpcUrl = args[i + 1];
+      i++;
+      continue;
+    }
+    if (arg === '--no-program-scan') {
+      includeProgramScan = false;
+      continue;
+    }
+    if (arg === '--no-scan-checkpoint') {
+      useProgramScanCheckpoint = false;
+      continue;
+    }
+    if (arg === '--scan-checkpoint-file') {
+      programScanCheckpointPath = args[i + 1];
+      i++;
+      continue;
+    }
+    // Backwards compatibility: treat a second positional arg as custom RPC
+    if (!arg.startsWith('-') && !customRpc) {
+      customRpc = arg;
+      continue;
+    }
+  }
 
   if (!walletAddress) {
     console.error('Usage: npx ts-node perpTradeHistory.ts <wallet-address> [rpc-endpoint]');
+    console.error('  Flags:');
+    console.error('    --rpc <url>           Custom RPC endpoint');
+    console.error('    --start <date>        Start date (ISO or YYYY-MM-DD)');
+    console.error('    --end <date>          End date (ISO or YYYY-MM-DD)');
+    console.error('    --listen              Start log capture (WebSocket) for maker fills');
+    console.error('    --log-file <path>     Log capture file (JSONL). Used by --listen and --include-logs');
+    console.error('    --include-logs <path> Merge captured logs into history fetch');
+    console.error('    --compare-ui <path>   Compare fills vs UI orders JSON');
+    console.error('    --ui-timezone <local|utc>  Timezone for UI comparison (default: utc)');
+    console.error('    --helius              Use Helius RPC endpoint (free methods only)');
+    console.error('    --helius-key <key>    Helius API key (or set HELIUS_API_KEY)');
+    console.error('    --helius-rpc <url>    Full Helius RPC URL (overrides --helius-key)');
+    console.error('    --no-program-scan     Disable program-wide scan (maker fills may be missed)');
+    console.error('    --no-scan-checkpoint  Disable incremental scan checkpoint');
+    console.error('    --scan-checkpoint-file <path> Custom checkpoint file path');
     console.error('Examples:');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ https://devnet.helius-rpc.com');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --include-logs logs/deriverse-logs.jsonl --compare-ui trades-ui/trade-history-extracted.json');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --start 2025-11-06 --end 2025-12-06');
     console.error('Note: Deriverse is only deployed on Solana devnet');
     process.exit(1);
   }
 
-  // Default to official devnet, but allow custom RPC
-  const rpcUrl = customRpc || 'https://api.devnet.solana.com';
+  if ((heliusApiKey || heliusRpcUrl) && !customRpc) {
+    helius = true;
+  }
+  if (!helius && !customRpc && (process.env.HELIUS_RPC_URL || process.env.HELIUS_API_KEY)) {
+    helius = true;
+  }
 
-  // Set date range: December 1, 2025 to today
-  const startDate = new Date('2025-12-01T00:00:00Z');
-  const endDate = new Date(); // Use current time as end date
+  if (helius) {
+    if (!heliusRpcUrl) {
+      const envRpc = process.env.HELIUS_RPC_URL;
+      if (envRpc) {
+        heliusRpcUrl = envRpc;
+      } else {
+        const key = heliusApiKey || process.env.HELIUS_API_KEY;
+        if (!key) {
+          console.error('❌ Helius enabled but no API key provided. Set HELIUS_RPC_URL/HELIUS_API_KEY or use --helius-key / --helius-rpc.');
+          process.exit(1);
+        }
+        heliusRpcUrl = `https://devnet.helius-rpc.com/?api-key=${key}`;
+      }
+    }
+  }
+
+  // Default to official devnet, but allow custom RPC. Prefer Helius RPC if enabled.
+  const rpcUrl = customRpc || heliusRpcUrl || 'https://api.devnet.solana.com';
+  const usingHeliusRpc = Boolean(heliusRpcUrl && rpcUrl === heliusRpcUrl);
+  const defaultLogFile = path.join(process.cwd(), 'logs', `deriverse-logs-${walletAddress.slice(0, 8)}.jsonl`);
+  if (!logFilePath && (listen || compareUiPath)) {
+    logFilePath = defaultLogFile;
+  }
+
+  const parseDate = (value: string | undefined, label: string): Date | null => {
+    if (!value) return null;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      console.error(`❌ Invalid ${label} date: ${value}`);
+      process.exit(1);
+    }
+    return parsed;
+  };
+
+  // Default window keeps free-mode scans practical; override via --start/--end.
+  const defaultLookbackDays = 14;
+  const startDate = parseDate(startDateInput, 'start') || new Date(Date.now() - defaultLookbackDays * 24 * 60 * 60 * 1000);
+  const endDate = parseDate(endDateInput, 'end') || new Date(); // Use current time as end date
 
   console.log(`🌐 Using Solana devnet RPC: ${rpcUrl}`);
-  if (customRpc) {
+  if (usingHeliusRpc) {
+    console.log(`⚡ Using Helius devnet RPC (free JSON-RPC methods)`);
+  } else if (customRpc) {
     console.log(`🔧 Custom RPC endpoint specified`);
   } else {
     console.log(`⚡ Using official devnet RPC (may have limitations)`);
@@ -1315,7 +2255,17 @@ async function main() {
 
     await retriever.initialize();
 
-    const history = await retriever.fetchPerpTradeHistory(walletAddress);
+    if (listen) {
+      await retriever.startLogService(walletAddress, logFilePath || defaultLogFile);
+      return;
+    }
+
+    const history = await retriever.fetchPerpTradeHistory(walletAddress, {
+      logFilePath,
+      includeProgramScan,
+      programScanCheckpointPath,
+      disableProgramScanCheckpoint: !useProgramScanCheckpoint
+    });
 
     // Print summary to console
     console.log('\n=== PERPETUAL TRADING SUMMARY ===');
@@ -1361,6 +2311,13 @@ async function main() {
       if (closedTrades.length > 5) {
         console.log(`... and ${closedTrades.length - 5} more completed trades`);
       }
+    }
+
+    if (compareUiPath) {
+      retriever.compareWithUiOrders(compareUiPath, history.filledOrders, uiTimeZone, {
+        start: startDate,
+        end: endDate
+      });
     }
 
     // Export to file

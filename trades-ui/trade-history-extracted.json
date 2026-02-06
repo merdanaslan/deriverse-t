@@ -1,0 +1,206 @@
+[
+  {
+    "action": "Taker Buy",
+    "price": 136.14,
+    "amount": 1,
+    "datetime": "2025-12-05 13:45:36"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 135.96,
+    "amount": 1,
+    "datetime": "2025-12-05 13:46:44"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 135.94,
+    "amount": 1,
+    "datetime": "2025-12-05 13:47:43"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 136.04,
+    "amount": 1,
+    "datetime": "2025-12-05 13:48:33"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 136.08,
+    "amount": 1,
+    "datetime": "2025-12-05 13:49:44"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 136.06,
+    "amount": 1,
+    "datetime": "2025-12-05 13:50:10"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 136.08,
+    "amount": 9,
+    "datetime": "2025-12-05 13:50:10"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 135.1,
+    "amount": 10,
+    "datetime": "2025-12-05 14:54:27"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 135.12,
+    "amount": 1,
+    "datetime": "2025-12-05 14:54:27"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 132.8,
+    "amount": 1.05,
+    "datetime": "2025-12-06 17:54:07"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 132.92,
+    "amount": 2.01,
+    "datetime": "2025-12-06 17:56:09"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 132.88,
+    "amount": 0.06,
+    "datetime": "2025-12-06 17:57:41"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 132.96,
+    "amount": 1.5,
+    "datetime": "2025-12-06 18:00:30"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 135.6,
+    "amount": 1.5,
+    "datetime": "2025-12-08 16:51:33"
+  },
+  {
+    "action": "Maker Buy",
+    "price": 135.0,
+    "amount": 1.7,
+    "datetime": "2025-12-08 17:45:59"
+  },
+  {
+    "action": "Maker Sell",
+    "price": 135.1,
+    "amount": 1.7,
+    "datetime": "2025-12-08 17:52:59"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 143.06,
+    "amount": 3,
+    "datetime": "2025-12-09 17:56:40"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 143.02,
+    "amount": 3,
+    "datetime": "2025-12-09 17:57:17"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 142.96,
+    "amount": 4,
+    "datetime": "2025-12-09 17:57:40"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 142.92,
+    "amount": 4,
+    "datetime": "2025-12-09 17:57:51"
+  },
+  {
+    "action": "Maker Sell",
+    "price": 142.76,
+    "amount": 1,
+    "datetime": "2025-12-09 18:26:07"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 136.94,
+    "amount": 1,
+    "datetime": "2025-12-10 17:29:23"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 136.94,
+    "amount": 9,
+    "datetime": "2025-12-10 17:29:47"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 136.96,
+    "amount": 2,
+    "datetime": "2025-12-10 17:29:47"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 136.42,
+    "amount": 5,
+    "datetime": "2025-12-10 17:31:34"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 136.44,
+    "amount": 10,
+    "datetime": "2025-12-10 17:31:34"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 136.6,
+    "amount": 4,
+    "datetime": "2025-12-10 18:06:11"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 136.72,
+    "amount": 1.11,
+    "datetime": "2025-12-10 18:08:39"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 137.96,
+    "amount": 1.11,
+    "datetime": "2025-12-10 19:49:10"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 138.16,
+    "amount": 2.3,
+    "datetime": "2025-12-10 19:50:04"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 141.0,
+    "amount": 3.1,
+    "datetime": "2025-12-10 20:42:59"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 140.2,
+    "amount": 3.1,
+    "datetime": "2025-12-10 20:49:48"
+  },
+  {
+    "action": "Maker Sell",
+    "price": 81.48,
+    "amount": 1,
+    "datetime": "2026-02-06 12:55:11"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 82.65,
+    "amount": 1,
+    "datetime": "2026-02-06 13:29:31"
+  }
+]
