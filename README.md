@@ -19,6 +19,9 @@ npm run dev Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
 export HELIUS_API_KEY=YOUR_KEY
 npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --start 2025-11-06 --end 2025-12-06
 
+# Chunked 3-month backfill (free mode) + UI compare
+npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --backfill-3m --chunk-days 1 --compare-ui trades-ui/trade-history-extracted.json
+
 # Capture maker fills via WebSocket logs (runs continuously)
 npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl
 
@@ -60,7 +63,14 @@ npm run dev -- <wallet> --helius --start 2025-11-06 --end 2025-12-06
 ```
 
 Notes:
-- Default fetch window is the last 14 days (set `--start`/`--end` for custom or historical backfills).
+- Default fetch window is the last 28 days (set `--start`/`--end` for custom or historical backfills).
+- Use `--backfill-3m` for a one-time historical bootstrap; it merges chunk outputs into one final JSON.
+- Backfill uses a wallet-activity-first strategy:
+  - First pass per chunk: wallet/client fetch only (cheap).
+  - Progressive maker refinement on active chunks:
+    - pass 1: `±maker-padding-minutes` around unresolved place events (default `±15m`)
+    - pass 2+: only if still unresolved, expand forward windows (`6h`, `1d`, `3d`, `7d`, `28d`)
+- Tune with `--chunk-days <n>` and `--maker-padding-minutes <n>`.
 - Devnet history is limited by provider retention. Run this periodically (e.g. every 10–12 days) to avoid gaps.
 - Use `--helius-rpc <url>` if you want to pass a full endpoint directly.
 - You can also create `.env` based on `.env.example` with `HELIUS_RPC_URL` or `HELIUS_API_KEY`.

@@ -206,6 +206,11 @@ class PerpTradeHistoryRetriever {
     this.endDate = endDate;
   }
 
+  setDateRange(startDate: Date, endDate: Date): void {
+    this.startDate = startDate;
+    this.endDate = endDate;
+  }
+
   private deriveClientPrimaryPDA(walletAddress: string): PublicKey {
     const tagBuf = Buffer.alloc(8);
     tagBuf.writeUint32LE(1, 0);  // version
@@ -289,8 +294,13 @@ class PerpTradeHistoryRetriever {
       includeProgramScan?: boolean;
       programScanCheckpointPath?: string;
       disableProgramScanCheckpoint?: boolean;
+      programScanBeforeSignature?: string;
+      programScanUntilSignature?: string;
     }
   ): Promise<PerpTradingHistory> {
+    // Reset leverage timeline between runs to avoid cross-range contamination.
+    this.leverageTimeline = new Map();
+
     console.log(`\n📅 Date Range: ${this.startDate.toLocaleDateString()} to ${this.endDate.toLocaleDateString()}`);
     console.log(`Fetching perpetual trade history for wallet: ${walletAddress}`);
 
@@ -338,7 +348,9 @@ class PerpTradeHistoryRetriever {
       }
       const programScanTxs = await this.getProgramTransactionsViaRpcScan(walletAddress, {
         checkpointPath: options?.programScanCheckpointPath,
-        useCheckpoint: !options?.disableProgramScanCheckpoint
+        useCheckpoint: !options?.disableProgramScanCheckpoint,
+        beforeSignature: options?.programScanBeforeSignature,
+        untilSignature: options?.programScanUntilSignature
       });
       if (programScanTxs.length > 0) {
         console.log(`⚡ Program scan returned ${programScanTxs.length} candidate transactions`);
@@ -860,7 +872,12 @@ class PerpTradeHistoryRetriever {
 
   private async getProgramTransactionsViaRpcScan(
     walletAddress: string,
-    options?: { checkpointPath?: string; useCheckpoint?: boolean }
+    options?: {
+      checkpointPath?: string;
+      useCheckpoint?: boolean;
+      beforeSignature?: string;
+      untilSignature?: string;
+    }
   ): Promise<CapturedLogRecord[]> {
     console.log(`🔎 Scanning Deriverse program transactions (free RPC mode)...`);
 
@@ -883,7 +900,7 @@ class PerpTradeHistoryRetriever {
     let firstSeenSignature: string | undefined;
     let firstSeenBlockTime: number | undefined;
 
-    let beforeSignature: string | undefined = undefined;
+    let beforeSignature: string | undefined = options?.beforeSignature;
     let hasMore = true;
     let pageCount = 0;
     const maxPages = 250;
@@ -914,7 +931,12 @@ class PerpTradeHistoryRetriever {
 
       let hitDateLimit = false;
       let hitCheckpoint = false;
+      let hitUntilBoundary = false;
       for (const sig of signatures) {
+        if (options?.untilSignature && sig.signature === options.untilSignature) {
+          hitUntilBoundary = true;
+          break;
+        }
         if (checkpoint && sig.signature === checkpoint.latestSignature) {
           hitCheckpoint = true;
           break;
@@ -931,6 +953,9 @@ class PerpTradeHistoryRetriever {
 
       if (hitCheckpoint) {
         console.log(`   ✅ Reached checkpoint boundary, stopping scan.`);
+        hasMore = false;
+      } else if (hitUntilBoundary) {
+        console.log(`   ✅ Reached provided until-signature boundary, stopping scan.`);
         hasMore = false;
       } else if (hitDateLimit || signatures.length < 1000) {
         hasMore = false;
@@ -2052,6 +2077,85 @@ class PerpTradeHistoryRetriever {
     };
   }
 
+  mergeHistoryChunks(
+    walletAddress: string,
+    chunks: PerpTradingHistory[],
+    range?: { start?: Date; end?: Date }
+  ): PerpTradingHistory {
+    const tradeMap = new Map<string, PerpTradeData>();
+    const fillMap = new Map<string, PerpTradeData>();
+    const fundingMap = new Map<string, PerpFundingData>();
+    const balanceMap = new Map<string, { instrumentId: number; timestamp: number; amount: number; type: 'deposit' | 'withdraw' }>();
+
+    const tradeKey = (t: PerpTradeData): string => `${t.tradeId}|${t.type}|${t.timestamp}`;
+    const fillKey = (t: PerpTradeData): string => `${t.tradeId}|${t.timestamp}`;
+    const fundingKey = (f: PerpFundingData): string => `${f.instrumentId}|${f.timestamp}|${f.fundingAmount}`;
+    const balanceKey = (b: { instrumentId: number; timestamp: number; amount: number; type: 'deposit' | 'withdraw' }): string =>
+      `${b.instrumentId}|${b.timestamp}|${b.amount}|${b.type}`;
+
+    for (const chunk of chunks) {
+      for (const t of chunk.tradeHistory) {
+        tradeMap.set(tradeKey(t), t);
+      }
+      for (const f of chunk.filledOrders) {
+        fillMap.set(fillKey(f), f);
+      }
+      for (const f of chunk.fundingHistory) {
+        fundingMap.set(fundingKey(f), f);
+      }
+      for (const b of chunk.depositWithdrawHistory) {
+        balanceMap.set(balanceKey(b), b);
+      }
+    }
+
+    const mergedTradeHistory = Array.from(tradeMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const mergedFilledOrders = Array.from(fillMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const mergedFunding = Array.from(fundingMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const mergedBalances = Array.from(balanceMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+
+    const newestChunk = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
+    const mergedTrades = this.groupFillsIntoTrades(mergedFilledOrders);
+    const result: PerpTradingHistory = {
+      walletAddress,
+      retrievalTime: new Date().toISOString(),
+      totalPerpTrades: mergedTradeHistory.filter(t => t.type === 'fill').length,
+      positions: newestChunk?.positions || [],
+      tradeHistory: mergedTradeHistory,
+      filledOrders: mergedFilledOrders,
+      trades: mergedTrades,
+      fundingHistory: mergedFunding,
+      depositWithdrawHistory: mergedBalances,
+      summary: {
+        totalTrades: 0,
+        totalFees: 0,
+        totalRebates: 0,
+        netFunding: 0,
+        netPnL: 0,
+        activePositions: 0,
+        completedTrades: 0,
+        totalRealizedPnL: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        winRate: 0
+      }
+    };
+
+    // Ensure global range boundaries are respected after merge.
+    if (range?.start || range?.end) {
+      const startTs = range.start ? range.start.getTime() : Number.NEGATIVE_INFINITY;
+      const endTs = range.end ? range.end.getTime() : Number.POSITIVE_INFINITY;
+      result.tradeHistory = result.tradeHistory.filter(t => t.timestamp >= startTs && t.timestamp <= endTs);
+      result.filledOrders = result.filledOrders.filter(t => t.timestamp >= startTs && t.timestamp <= endTs);
+      result.fundingHistory = result.fundingHistory.filter(t => t.timestamp >= startTs && t.timestamp <= endTs);
+      result.depositWithdrawHistory = result.depositWithdrawHistory.filter(t => t.timestamp >= startTs && t.timestamp <= endTs);
+      result.trades = this.groupFillsIntoTrades(result.filledOrders);
+      result.totalPerpTrades = result.tradeHistory.filter(t => t.type === 'fill').length;
+    }
+
+    result.summary = this.calculateSummary(result);
+    return result;
+  }
+
   async exportToFile(data: PerpTradingHistory, filename?: string): Promise<string> {
     if (!filename) {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2087,6 +2191,9 @@ async function main() {
   let includeProgramScan = true;
   let useProgramScanCheckpoint = true;
   let programScanCheckpointPath: string | undefined;
+  let backfill3m = false;
+  let chunkDays = 1;
+  let makerPaddingMinutes = 15;
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
@@ -2156,6 +2263,30 @@ async function main() {
       i++;
       continue;
     }
+    if (arg === '--backfill-3m') {
+      backfill3m = true;
+      continue;
+    }
+    if (arg === '--chunk-days') {
+      const parsed = Number(args[i + 1]);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.error(`❌ Invalid --chunk-days value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      chunkDays = Math.max(0.25, parsed);
+      i++;
+      continue;
+    }
+    if (arg === '--maker-padding-minutes') {
+      const parsed = Number(args[i + 1]);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        console.error(`❌ Invalid --maker-padding-minutes value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      makerPaddingMinutes = parsed;
+      i++;
+      continue;
+    }
     // Backwards compatibility: treat a second positional arg as custom RPC
     if (!arg.startsWith('-') && !customRpc) {
       customRpc = arg;
@@ -2180,12 +2311,16 @@ async function main() {
     console.error('    --no-program-scan     Disable program-wide scan (maker fills may be missed)');
     console.error('    --no-scan-checkpoint  Disable incremental scan checkpoint');
     console.error('    --scan-checkpoint-file <path> Custom checkpoint file path');
+    console.error('    --backfill-3m         Run chunked 3-month backfill and merge to one output');
+    console.error('    --chunk-days <n>      Chunk size in days for backfill mode (default: 1)');
+    console.error('    --maker-padding-minutes <n>  Program-scan padding around wallet activity (default: 15)');
     console.error('Examples:');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ https://devnet.helius-rpc.com');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --include-logs logs/deriverse-logs.jsonl --compare-ui trades-ui/trade-history-extracted.json');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --start 2025-11-06 --end 2025-12-06');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --backfill-3m --compare-ui trades-ui/trade-history-extracted.json');
     console.error('Note: Deriverse is only deployed on Solana devnet');
     process.exit(1);
   }
@@ -2231,10 +2366,12 @@ async function main() {
     return parsed;
   };
 
-  // Default window keeps free-mode scans practical; override via --start/--end.
-  const defaultLookbackDays = 14;
-  const startDate = parseDate(startDateInput, 'start') || new Date(Date.now() - defaultLookbackDays * 24 * 60 * 60 * 1000);
+  // Default window keeps free-mode scans practical while covering a useful history horizon.
+  const defaultLookbackDays = 28;
   const endDate = parseDate(endDateInput, 'end') || new Date(); // Use current time as end date
+  const explicitStartDate = parseDate(startDateInput, 'start');
+  const backfillStartDate = new Date(endDate.getTime() - 90 * 24 * 60 * 60 * 1000);
+  const startDate = explicitStartDate || (backfill3m ? backfillStartDate : new Date(Date.now() - defaultLookbackDays * 24 * 60 * 60 * 1000));
 
   console.log(`🌐 Using Solana devnet RPC: ${rpcUrl}`);
   if (usingHeliusRpc) {
@@ -2246,6 +2383,117 @@ async function main() {
   }
   console.log(`📍 Deriverse is only available on devnet`);
   console.log(`📅 Fetching data from ${startDate.toLocaleDateString()} to ${endDate.toLocaleDateString()}\n`);
+
+  const printSummary = (history: PerpTradingHistory): void => {
+    console.log('\n=== PERPETUAL TRADING SUMMARY ===');
+    console.log(`Wallet: ${history.walletAddress}`);
+    console.log(`Network: devnet`);
+    console.log(`Total Fill Events: ${history.summary.totalTrades}`);
+    console.log(`Completed Trades: ${history.summary.completedTrades}`);
+    console.log(`Win Rate: ${history.summary.winRate.toFixed(1)}% (${history.summary.winningTrades}W/${history.summary.losingTrades}L)`);
+    console.log(`Total Realized PnL: ${history.summary.totalRealizedPnL.toFixed(4)} USDC`);
+    console.log(`Active Positions: ${history.summary.activePositions}`);
+    console.log(`Total Fees: ${history.summary.totalFees.toFixed(4)} USDC`);
+    console.log(`Total Rebates: ${history.summary.totalRebates.toFixed(4)} USDC`);
+    console.log(`Net Funding: ${history.summary.netFunding.toFixed(4)}`);
+    console.log(`Instruments Traded: ${history.positions.length}`);
+
+    const closedTrades = history.trades.filter(t => t.status === 'closed');
+    if (closedTrades.length === 0) {
+      return;
+    }
+
+    console.log('\n=== RECENT TRADES ===');
+    const recentTrades = closedTrades
+      .sort((a, b) => new Date(b.entryTime).getTime() - new Date(a.entryTime).getTime())
+      .slice(0, 5);
+
+    for (const trade of recentTrades) {
+      const entryTime = new Date(trade.entryTime).toLocaleString();
+      const exitTime = trade.exitTime ? new Date(trade.exitTime).toLocaleString() : 'N/A';
+      const duration = trade.exitTime
+        ? Math.round((new Date(trade.exitTime).getTime() - new Date(trade.entryTime).getTime()) / 60000)
+        : 0;
+      const pnlColor = (trade.realizedPnL || 0) >= 0 ? '🟢' : '🔴';
+      const directionEmoji = trade.direction === 'long' ? '📈' : '📉';
+
+      console.log(`${directionEmoji} ${trade.direction.toUpperCase()} ${trade.peakQuantity} SOL`);
+      console.log(`   Entry: ${entryTime} @ $${trade.entryPrice.toFixed(4)}`);
+      console.log(`   Exit:  ${exitTime} @ $${(trade.exitPrice || 0).toFixed(4)} (${duration}min)`);
+      console.log(`   Peak Notional: $${trade.peakNotionalValue.toFixed(2)} | Fees: $${trade.netFees.toFixed(4)}`);
+      console.log(`   ${pnlColor} PnL: ${trade.realizedPnL?.toFixed(4)} USDC (${trade.realizedPnLPercent?.toFixed(2)}%)`);
+      console.log('');
+    }
+
+    if (closedTrades.length > 5) {
+      console.log(`... and ${closedTrades.length - 5} more completed trades`);
+    }
+  };
+
+  const collectWalletSignatures = async (
+    wallet: string,
+    rangeStart: Date,
+    rangeEnd: Date
+  ): Promise<Array<{ signature: string; blockTimeMs: number }>> => {
+    const connection = new Connection(rpcUrl, 'confirmed');
+    const startTs = Math.floor(rangeStart.getTime() / 1000);
+    const endTs = Math.floor(rangeEnd.getTime() / 1000);
+    const signaturesInRange: Array<{ signature: string; blockTimeMs: number }> = [];
+    let before: string | undefined;
+    let done = false;
+    let page = 0;
+
+    while (!done) {
+      page++;
+      let signatures: Array<{ signature: string; blockTime: number | null }> = [];
+      for (let retry = 0; retry < 8; retry++) {
+        try {
+          signatures = await connection.getSignaturesForAddress(new PublicKey(wallet), { limit: 1000, before }) as any;
+          break;
+        } catch (error: any) {
+          const message = String(error?.message || error);
+          if (message.includes('429') || message.includes('Too Many Requests')) {
+            const delay = 500 * Math.pow(2, retry);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      if (signatures.length === 0) {
+        break;
+      }
+
+      let reachedRangeStart = false;
+      for (const sig of signatures) {
+        const bt = sig.blockTime || 0;
+        if (bt < startTs) {
+          reachedRangeStart = true;
+          break;
+        }
+        if (bt >= startTs && bt <= endTs) {
+          signaturesInRange.push({
+            signature: sig.signature,
+            blockTimeMs: bt * 1000
+          });
+        }
+      }
+
+      if (reachedRangeStart || signatures.length < 1000) {
+        done = true;
+      } else {
+        before = signatures[signatures.length - 1].signature;
+      }
+
+      if (!done && page % 5 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 120));
+      }
+    }
+
+    signaturesInRange.sort((a, b) => b.blockTimeMs - a.blockTimeMs);
+    return signaturesInRange;
+  };
 
   try {
     const retriever = new PerpTradeHistoryRetriever(rpcUrl, startDate, endDate);
@@ -2260,58 +2508,249 @@ async function main() {
       return;
     }
 
-    const history = await retriever.fetchPerpTradeHistory(walletAddress, {
-      logFilePath,
-      includeProgramScan,
-      programScanCheckpointPath,
-      disableProgramScanCheckpoint: !useProgramScanCheckpoint
-    });
-
-    // Print summary to console
-    console.log('\n=== PERPETUAL TRADING SUMMARY ===');
-    console.log(`Wallet: ${history.walletAddress}`);
-    console.log(`Network: devnet`);
-    console.log(`Total Fill Events: ${history.summary.totalTrades}`);
-    console.log(`Completed Trades: ${history.summary.completedTrades}`);
-    console.log(`Win Rate: ${history.summary.winRate.toFixed(1)}% (${history.summary.winningTrades}W/${history.summary.losingTrades}L)`);
-    console.log(`Total Realized PnL: ${history.summary.totalRealizedPnL.toFixed(4)} USDC`);
-    console.log(`Active Positions: ${history.summary.activePositions}`);
-    console.log(`Total Fees: ${history.summary.totalFees.toFixed(4)} USDC`);
-    console.log(`Total Rebates: ${history.summary.totalRebates.toFixed(4)} USDC`);
-    console.log(`Net Funding: ${history.summary.netFunding.toFixed(4)}`);
-    console.log(`Instruments Traded: ${history.positions.length}`);
-
-    // Show detailed trade information for closed trades
-    const closedTrades = history.trades.filter(t => t.status === 'closed');
-    if (closedTrades.length > 0) {
-      console.log('\n=== RECENT TRADES ===');
-      
-      // Sort by entry time (most recent first) and show last 5 trades
-      const recentTrades = closedTrades
-        .sort((a, b) => new Date(b.entryTime).getTime() - new Date(a.entryTime).getTime())
-        .slice(0, 5);
-      
-      for (const trade of recentTrades) {
-        const entryTime = new Date(trade.entryTime).toLocaleString();
-        const exitTime = trade.exitTime ? new Date(trade.exitTime).toLocaleString() : 'N/A';
-        const duration = trade.exitTime ? 
-          Math.round((new Date(trade.exitTime).getTime() - new Date(trade.entryTime).getTime()) / 60000) : 0;
-        
-        const pnlColor = (trade.realizedPnL || 0) >= 0 ? '🟢' : '🔴';
-        const directionEmoji = trade.direction === 'long' ? '📈' : '📉';
-        
-        console.log(`${directionEmoji} ${trade.direction.toUpperCase()} ${trade.peakQuantity} SOL`);
-        console.log(`   Entry: ${entryTime} @ $${trade.entryPrice.toFixed(4)}`);
-        console.log(`   Exit:  ${exitTime} @ $${(trade.exitPrice || 0).toFixed(4)} (${duration}min)`);
-        console.log(`   Peak Notional: $${trade.peakNotionalValue.toFixed(2)} | Fees: $${trade.netFees.toFixed(4)}`);
-        console.log(`   ${pnlColor} PnL: ${trade.realizedPnL?.toFixed(4)} USDC (${trade.realizedPnLPercent?.toFixed(2)}%)`);
-        console.log('');
+    let history: PerpTradingHistory;
+    if (!backfill3m) {
+      history = await retriever.fetchPerpTradeHistory(walletAddress, {
+        logFilePath,
+        includeProgramScan,
+        programScanCheckpointPath,
+        disableProgramScanCheckpoint: !useProgramScanCheckpoint
+      });
+    } else {
+      const chunkMs = Math.floor(chunkDays * 24 * 60 * 60 * 1000);
+      const ranges: Array<{ start: Date; end: Date }> = [];
+      for (let cursor = startDate.getTime(); cursor <= endDate.getTime(); cursor += chunkMs) {
+        const chunkStart = new Date(cursor);
+        const chunkEnd = new Date(Math.min(endDate.getTime(), cursor + chunkMs - 1000));
+        ranges.push({ start: chunkStart, end: chunkEnd });
       }
-      
-      if (closedTrades.length > 5) {
-        console.log(`... and ${closedTrades.length - 5} more completed trades`);
+
+      const progressiveMakerPassMinutes = Array.from(new Set([
+        makerPaddingMinutes,
+        6 * 60,
+        24 * 60,
+        3 * 24 * 60,
+        7 * 24 * 60,
+        28 * 24 * 60
+      ].filter(minutes => minutes >= makerPaddingMinutes))).sort((a, b) => a - b);
+      const formatMinutesCompact = (minutes: number): string => {
+        if (minutes % (24 * 60) === 0) {
+          return `${minutes / (24 * 60)}d`;
+        }
+        if (minutes % 60 === 0) {
+          return `${minutes / 60}h`;
+        }
+        return `${minutes}m`;
+      };
+
+      console.log(
+        `🧱 Backfill mode enabled: ${ranges.length} chunks (${chunkDays} day/chunk, ` +
+        `maker passes ${progressiveMakerPassMinutes.map(formatMinutesCompact).join(' -> ')})`
+      );
+      const noActivity = (error: any): boolean =>
+        String(error?.message || error).includes('no Deriverse trading activity');
+
+      const walletSignatures = await collectWalletSignatures(walletAddress, startDate, endDate);
+      const walletTimes = walletSignatures.map(item => item.blockTimeMs);
+      const candidateIndexesSet = new Set<number>();
+      if (walletTimes.length > 0) {
+        const baseTs = startDate.getTime();
+        for (const ts of walletTimes) {
+          const chunkIndex = Math.floor((ts - baseTs) / chunkMs);
+          for (const idxOffset of [-1, 0, 1]) {
+            const idx = chunkIndex + idxOffset;
+            if (idx >= 0 && idx < ranges.length) {
+              candidateIndexesSet.add(idx);
+            }
+          }
+        }
       }
+
+      const candidateIndexes = Array.from(candidateIndexesSet).sort((a, b) => a - b);
+      if (candidateIndexes.length === 0) {
+        throw new Error('No wallet signatures found in selected backfill range');
+      }
+      console.log(`🎯 Active chunk candidates: ${candidateIndexes.length}/${ranges.length}`);
+
+      const collectedChunks: PerpTradingHistory[] = [];
+      for (let activePos = 0; activePos < candidateIndexes.length; activePos++) {
+        const idx = candidateIndexes[activePos];
+        const range = ranges[idx];
+        console.log(`\n🧱 Chunk ${idx + 1}/${ranges.length} (active ${activePos + 1}/${candidateIndexes.length}): ${range.start.toISOString()} → ${range.end.toISOString()}`);
+        retriever.setDateRange(range.start, range.end);
+
+        let baseHistory: PerpTradingHistory;
+        try {
+          baseHistory = await retriever.fetchPerpTradeHistory(walletAddress, {
+            includeProgramScan: false
+          });
+        } catch (error) {
+          if (noActivity(error)) {
+            console.log('   ℹ️ No wallet activity in this chunk, skipping.');
+            continue;
+          }
+          throw error;
+        }
+
+        let chunkHistory = baseHistory;
+        if (includeProgramScan && baseHistory.tradeHistory.length > 0) {
+          const getUnresolvedPlaceEvents = (history: PerpTradingHistory): PerpTradeData[] => {
+            const fillSignatures = new Set(
+              history.filledOrders.map(fill => fill.tradeId.split('-')[0])
+            );
+            const filledOrderIds = new Set(
+              history.filledOrders.map(fill => fill.orderId.toString())
+            );
+            const canceledOrderIds = new Set(
+              history.tradeHistory
+                .filter(event => event.type === 'cancel' || event.type === 'revoke')
+                .map(event => event.orderId.toString())
+            );
+            return history.tradeHistory.filter(event => {
+              if (event.type !== 'place') return false;
+              const signature = event.tradeId.split('-')[0];
+              if (fillSignatures.has(signature)) return false;
+              const orderId = event.orderId.toString();
+              if (filledOrderIds.has(orderId)) return false;
+              if (canceledOrderIds.has(orderId)) return false;
+              return true;
+            });
+          };
+
+          const mergeWindows = (rawWindows: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> => {
+            const sorted = rawWindows
+              .filter(window => window.start <= window.end)
+              .sort((a, b) => a.start - b.start);
+            const merged: Array<{ start: number; end: number }> = [];
+            for (const window of sorted) {
+              const previous = merged[merged.length - 1];
+              if (!previous || window.start > previous.end + 1000) {
+                merged.push({ ...window });
+              } else {
+                previous.end = Math.max(previous.end, window.end);
+              }
+            }
+            return merged;
+          };
+
+          const resolveAnchorsForWindow = (
+            windowStart: number,
+            windowEnd: number
+          ): { before?: string; until?: string } => {
+            let before: string | undefined;
+            for (let i = walletSignatures.length - 1; i >= 0; i--) {
+              if (walletSignatures[i].blockTimeMs > windowEnd) {
+                before = walletSignatures[i].signature;
+                break;
+              }
+            }
+            let until: string | undefined;
+            for (const sigInfo of walletSignatures) {
+              if (sigInfo.blockTimeMs < windowStart) {
+                until = sigInfo.signature;
+                break;
+              }
+            }
+            return { before, until };
+          };
+
+          const initialUnresolved = getUnresolvedPlaceEvents(baseHistory);
+          if (initialUnresolved.length > 0) {
+            console.log(
+              `   🔬 Program-scan refinement started with ${initialUnresolved.length} unresolved place events`
+            );
+
+            const paddingMs = makerPaddingMinutes * 60 * 1000;
+            for (let passIndex = 0; passIndex < progressiveMakerPassMinutes.length; passIndex++) {
+              const unresolvedPlaceEvents = getUnresolvedPlaceEvents(chunkHistory);
+              if (unresolvedPlaceEvents.length === 0) {
+                console.log(`   ✅ Maker refinement complete after pass ${passIndex}`);
+                break;
+              }
+
+              const passMaxMinutes = progressiveMakerPassMinutes[passIndex];
+              const previousPassMinutes = passIndex > 0 ? progressiveMakerPassMinutes[passIndex - 1] : makerPaddingMinutes;
+              const rawWindows = unresolvedPlaceEvents.map(event => {
+                const start = passIndex === 0
+                  ? event.timestamp - paddingMs
+                  : event.timestamp + previousPassMinutes * 60 * 1000 + 1000;
+                const end = event.timestamp + passMaxMinutes * 60 * 1000;
+                return {
+                  start: Math.max(range.start.getTime(), start),
+                  end: Math.min(range.end.getTime(), end)
+                };
+              });
+              const mergedWindows = mergeWindows(rawWindows);
+              if (mergedWindows.length === 0) {
+                continue;
+              }
+
+              const passLabel = passIndex === 0
+                ? `±${formatMinutesCompact(makerPaddingMinutes)}`
+                : `${formatMinutesCompact(previousPassMinutes)} -> ${formatMinutesCompact(passMaxMinutes)} after place`;
+              console.log(
+                `   🔁 Maker refinement pass ${passIndex + 1}/${progressiveMakerPassMinutes.length} ` +
+                `(${passLabel}): ${mergedWindows.length} windows from ${unresolvedPlaceEvents.length} unresolved places`
+              );
+
+              for (const window of mergedWindows) {
+                const scanStart = new Date(window.start);
+                const scanEnd = new Date(window.end);
+                const anchors = resolveAnchorsForWindow(window.start, window.end);
+                console.log(`      • ${scanStart.toISOString()} → ${scanEnd.toISOString()}`);
+                if (anchors.before || anchors.until) {
+                  console.log(
+                    `      • scan anchors before=${anchors.before?.slice(0, 8) || 'none'} ` +
+                    `until=${anchors.until?.slice(0, 8) || 'none'}`
+                  );
+                }
+
+                retriever.setDateRange(scanStart, scanEnd);
+                try {
+                  const refinedHistory = await retriever.fetchPerpTradeHistory(walletAddress, {
+                    includeProgramScan: true,
+                    disableProgramScanCheckpoint: true,
+                    programScanBeforeSignature: anchors.before,
+                    programScanUntilSignature: anchors.until
+                  });
+                  chunkHistory = retriever.mergeHistoryChunks(walletAddress, [chunkHistory, refinedHistory], {
+                    start: range.start,
+                    end: range.end
+                  });
+                } catch (error: any) {
+                  console.log(`      ⚠️ Refinement window failed, continuing: ${error?.message || error}`);
+                }
+              }
+
+              const unresolvedAfterPass = getUnresolvedPlaceEvents(chunkHistory).length;
+              console.log(`   ↪️ Unresolved places after pass ${passIndex + 1}: ${unresolvedAfterPass}`);
+            }
+
+            const unresolvedRemaining = getUnresolvedPlaceEvents(chunkHistory).length;
+            if (unresolvedRemaining > 0) {
+              console.log(`   ⚠️ ${unresolvedRemaining} unresolved place events remain after progressive refinement`);
+            }
+          } else {
+            console.log('   ℹ️ No unresolved place orders in chunk, skipping maker refinement.');
+          }
+        }
+
+        collectedChunks.push(chunkHistory);
+      }
+
+      if (collectedChunks.length === 0) {
+        throw new Error('No Deriverse activity found in selected backfill range');
+      }
+
+      retriever.setDateRange(startDate, endDate);
+      history = retriever.mergeHistoryChunks(walletAddress, collectedChunks, {
+        start: startDate,
+        end: endDate
+      });
+      console.log(`✅ Backfill merged: ${collectedChunks.length} non-empty chunks`);
     }
+
+    printSummary(history);
 
     if (compareUiPath) {
       retriever.compareWithUiOrders(compareUiPath, history.filledOrders, uiTimeZone, {
