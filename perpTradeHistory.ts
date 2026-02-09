@@ -15,6 +15,8 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
+const DERIVERSE_PROGRAM_ID = 'Drvrseg8AQLP8B96DBGmHRjFGviFNYTkHueY9g3k27Gu';
+
 const loadDotEnv = (envPath = path.join(process.cwd(), '.env')): void => {
   try {
     if (!fs.existsSync(envPath)) return;
@@ -182,7 +184,7 @@ class PerpTradeHistoryRetriever {
   constructor(rpcUrl: string = 'https://api.devnet.solana.com', startDate?: Date, endDate?: Date) {
     const rpc = createSolanaRpc(rpcUrl);
     // Use the correct program ID that was found in transactions: Drvrseg8AQLP8B96DBGmHRjFGviFNYTkHueY9g3k27Gu
-    const actualProgramId = 'Drvrseg8AQLP8B96DBGmHRjFGviFNYTkHueY9g3k27Gu' as Address;
+    const actualProgramId = DERIVERSE_PROGRAM_ID as Address;
     this.engine = new Engine(rpc, {
       programId: actualProgramId,
       version: VERSION,
@@ -296,6 +298,7 @@ class PerpTradeHistoryRetriever {
       disableProgramScanCheckpoint?: boolean;
       programScanBeforeSignature?: string;
       programScanUntilSignature?: string;
+      programScanMaxPages?: number;
     }
   ): Promise<PerpTradingHistory> {
     // Reset leverage timeline between runs to avoid cross-range contamination.
@@ -318,14 +321,21 @@ class PerpTradeHistoryRetriever {
 
     // Get user's clientId for filtering maker fills
     try {
-      this.userClientId = await this.resolveUserClientId(walletAddress);
-      if (this.userClientId !== undefined) {
+      const resolvedClientId = await this.resolveUserClientId(walletAddress);
+      if (resolvedClientId !== undefined) {
+        this.userClientId = resolvedClientId;
         console.log(`🆔 User clientId: ${this.userClientId}`);
+      } else if (this.userClientId !== undefined) {
+        console.log(`🆔 Reusing cached user clientId: ${this.userClientId}`);
       } else {
         console.log('⚠️ Could not resolve user clientId from engine; will try transaction inference.');
       }
     } catch (error) {
-      console.log('⚠️ Could not get clientId from engine, maker fill filtering may be limited');
+      if (this.userClientId !== undefined) {
+        console.log(`🆔 Reusing cached user clientId: ${this.userClientId}`);
+      } else {
+        console.log('⚠️ Could not get clientId from engine, maker fill filtering may be limited');
+      }
     }
 
     // Step 1: Get wallet's transaction history
@@ -350,7 +360,8 @@ class PerpTradeHistoryRetriever {
         checkpointPath: options?.programScanCheckpointPath,
         useCheckpoint: !options?.disableProgramScanCheckpoint,
         beforeSignature: options?.programScanBeforeSignature,
-        untilSignature: options?.programScanUntilSignature
+        untilSignature: options?.programScanUntilSignature,
+        maxPages: options?.programScanMaxPages
       });
       if (programScanTxs.length > 0) {
         console.log(`⚡ Program scan returned ${programScanTxs.length} candidate transactions`);
@@ -470,18 +481,29 @@ class PerpTradeHistoryRetriever {
   }
 
   private async fetchTransactionWithRetry(signature: string, retries = 10): Promise<any> {
+    const timeoutMs = 15000;
     for (let i = 0; i < retries; i++) {
       try {
-        const tx = await this.connection.getTransaction(signature, {
-          commitment: 'confirmed',
-          maxSupportedTransactionVersion: 0
-        });
+        const tx = await Promise.race([
+          this.connection.getTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0
+          }),
+          new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error(`getTransaction timeout after ${timeoutMs}ms`)), timeoutMs);
+          })
+        ]);
         return tx;
       } catch (error: any) {
-        if (error.message?.includes('429') || error.toString().includes('429') || error.toString().includes('Too Many Requests')) {
+        const message = String(error?.message || error);
+        if (
+          message.includes('429') ||
+          message.includes('Too Many Requests') ||
+          message.includes('timeout')
+        ) {
           // Exponential backoff: 1s, 2s, 4s, 8s, 16s
           const delay = 1000 * Math.pow(2, i);
-          console.log(`   ⏳ Rate limited on ${signature.slice(0, 8)}... retrying in ${delay}ms`);
+          console.log(`   ⏳ Temporary RPC issue on ${signature.slice(0, 8)}... retrying in ${delay}ms`);
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
@@ -491,15 +513,40 @@ class PerpTradeHistoryRetriever {
     throw new Error(`Failed to fetch tx ${signature} after ${retries} retries`);
   }
 
-  private async fetchTransactionsBatch(signatures: string[], retries = 8): Promise<Array<any | null>> {
+  private async fetchTransactionsBatch(
+    signatures: string[],
+    retries = 8,
+    maxConcurrency = 3,
+    interRequestDelayMs = 0
+  ): Promise<Array<any | null>> {
     if (signatures.length === 0) {
       return [];
     }
     const fetchIndividually = async (): Promise<Array<any | null>> => {
-      const settled = await Promise.allSettled(
-        signatures.map(signature => this.fetchTransactionWithRetry(signature))
-      );
-      return settled.map(result => (result.status === 'fulfilled' ? result.value : null));
+      const results: Array<any | null> = new Array(signatures.length).fill(null);
+      const concurrency = Math.min(Math.max(1, Math.floor(maxConcurrency)), signatures.length);
+      let nextIndex = 0;
+
+      const worker = async (): Promise<void> => {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex++;
+          if (currentIndex >= signatures.length) {
+            return;
+          }
+          try {
+            results[currentIndex] = await this.fetchTransactionWithRetry(signatures[currentIndex], retries);
+          } catch {
+            results[currentIndex] = null;
+          }
+          if (interRequestDelayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, interRequestDelayMs));
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      return results;
     };
     if (this.batchGetTransactionSupported === false) {
       return fetchIndividually();
@@ -816,13 +863,7 @@ class PerpTradeHistoryRetriever {
     return Array.from(map.values());
   }
 
-  private logBelongsToUser(log: any, isUserSigner: boolean): boolean {
-    if (isUserSigner) {
-      return true;
-    }
-    if (this.userClientId === undefined) {
-      return false;
-    }
+  private extractCandidateClientIds(log: any): number[] {
     const candidateIds = [
       log?.clientId,
       log?.refClientId,
@@ -832,7 +873,21 @@ class PerpTradeHistoryRetriever {
       log?.ownerClientId,
       log?.counterpartyClientId
     ];
-    return candidateIds.some(id => id !== undefined && Number(id) === this.userClientId);
+    return candidateIds
+      .filter(id => id !== undefined && id !== null)
+      .map(id => Number(id))
+      .filter(id => Number.isFinite(id));
+  }
+
+  private logBelongsToUser(log: any, isUserSigner: boolean): boolean {
+    if (isUserSigner) {
+      return true;
+    }
+    if (this.userClientId === undefined) {
+      return false;
+    }
+    const resolvedCandidateIds = this.extractCandidateClientIds(log);
+    return resolvedCandidateIds.some(id => id === this.userClientId);
   }
 
   private getDefaultProgramScanCheckpointPath(walletAddress: string): string {
@@ -877,6 +932,7 @@ class PerpTradeHistoryRetriever {
       useCheckpoint?: boolean;
       beforeSignature?: string;
       untilSignature?: string;
+      maxPages?: number;
     }
   ): Promise<CapturedLogRecord[]> {
     console.log(`🔎 Scanning Deriverse program transactions (free RPC mode)...`);
@@ -903,7 +959,13 @@ class PerpTradeHistoryRetriever {
     let beforeSignature: string | undefined = options?.beforeSignature;
     let hasMore = true;
     let pageCount = 0;
-    const maxPages = 250;
+    const requestedMaxPages = Number(options?.maxPages);
+    const maxPages = Number.isFinite(requestedMaxPages)
+      ? Math.max(1, Math.floor(requestedMaxPages))
+      : 250;
+    if (Number.isFinite(requestedMaxPages)) {
+      console.log(`   🔒 Program scan page cap: ${maxPages}`);
+    }
 
     while (hasMore) {
       pageCount++;
@@ -971,10 +1033,15 @@ class PerpTradeHistoryRetriever {
     console.log(`   Candidate program signatures in range: ${allSignatures.length}`);
 
     // Free-tier endpoints are sensitive to bursty getTransaction traffic.
-    const batchSize = 2;
+    const batchSize = 8;
     for (let i = 0; i < allSignatures.length; i += batchSize) {
       const batch = allSignatures.slice(i, i + batchSize);
-      const transactions = await this.fetchTransactionsBatch(batch.map(sig => sig.signature));
+      const transactions = await this.fetchTransactionsBatch(
+        batch.map(sig => sig.signature),
+        8,
+        1,
+        120
+      );
 
       for (let j = 0; j < transactions.length; j++) {
         const tx = transactions[j];
@@ -1013,7 +1080,7 @@ class PerpTradeHistoryRetriever {
       }
 
       if (i + batchSize < allSignatures.length) {
-        await new Promise(resolve => setTimeout(resolve, 250));
+        await new Promise(resolve => setTimeout(resolve, 150));
       }
     }
 
@@ -1077,14 +1144,21 @@ class PerpTradeHistoryRetriever {
 
     // Resolve clientId for filtering (if possible)
     try {
-      this.userClientId = await this.resolveUserClientId(walletAddress);
-      if (this.userClientId !== undefined) {
+      const resolvedClientId = await this.resolveUserClientId(walletAddress);
+      if (resolvedClientId !== undefined) {
+        this.userClientId = resolvedClientId;
         console.log(`🆔 User clientId: ${this.userClientId}`);
+      } else if (this.userClientId !== undefined) {
+        console.log(`🆔 Reusing cached user clientId: ${this.userClientId}`);
       } else {
         console.log('⚠️ Could not resolve user clientId from engine, log filtering may be broader');
       }
     } catch (error) {
-      console.log('⚠️ Could not get clientId from engine, log filtering may be broader');
+      if (this.userClientId !== undefined) {
+        console.log(`🆔 Reusing cached user clientId: ${this.userClientId}`);
+      } else {
+        console.log('⚠️ Could not get clientId from engine, log filtering may be broader');
+      }
     }
 
     const programKey = new PublicKey(this.engine.programId.toString());
@@ -1103,7 +1177,8 @@ class PerpTradeHistoryRetriever {
             return;
           }
 
-          if (!this.logMatchesClientId(decodedLogs)) {
+          const hasClientIdFilter = this.userClientId !== undefined;
+          if (hasClientIdFilter && !this.logMatchesClientId(decodedLogs)) {
             return;
           }
 
@@ -1117,11 +1192,17 @@ class PerpTradeHistoryRetriever {
             return;
           }
 
+          const isUserSigner = this.isUserSignerInTransaction(tx, walletAddress);
+          const belongsToUser = decodedLogs.some(log => this.logBelongsToUser(log as any, isUserSigner));
+          if (!belongsToUser) {
+            return;
+          }
+
           const record: CapturedLogRecord = {
             signature: logInfo.signature,
             blockTime: tx.blockTime || Math.floor(Date.now() / 1000),
             logs: tx.meta.logMessages,
-            isUserSigner: this.isUserSignerInTransaction(tx, walletAddress)
+            isUserSigner
           };
 
           await fs.promises.appendFile(logFilePath, JSON.stringify(record) + '\n');
@@ -1243,6 +1324,13 @@ class PerpTradeHistoryRetriever {
           const blockTimeMs = tx.blockTime * 1000; // Convert to milliseconds
           const logAny = log as any;
           const logBelongsToUser = this.logBelongsToUser(logAny, tx.isUserSigner);
+          const signerExplicitClientMismatch = (): boolean => {
+            if (!tx.isUserSigner || this.userClientId === undefined) {
+              return false;
+            }
+            const explicitClientIds = this.extractCandidateClientIds(logAny);
+            return explicitClientIds.length > 0 && !explicitClientIds.includes(this.userClientId);
+          };
 
           // Filter for perpetual-related events
           if (log instanceof PerpFillOrderReportModel) {
@@ -1313,6 +1401,10 @@ class PerpTradeHistoryRetriever {
           }
 
           if (log.constructor.name === 'PerpFeesReportModel' && logBelongsToUser) {
+            // Fees logs can include other clients in the same signer tx; honor explicit clientId mismatch.
+            if (signerExplicitClientMismatch()) {
+              continue;
+            }
             const rawEvent = serializeSdkObject(log);
 
             // Fees are often associated with the most recent fill/trade in the same transaction
@@ -1386,6 +1478,10 @@ class PerpTradeHistoryRetriever {
           }
 
           if (log instanceof PerpFundingReportModel && logBelongsToUser) {
+            // Funding logs can include many clients in one signer tx; honor explicit clientId mismatch.
+            if (signerExplicitClientMismatch()) {
+              continue;
+            }
             const eventTimeMs = log.time ? Number(log.time) * 1000 : blockTimeMs;
             result.funding.push({
               instrumentId: log.instrId,
@@ -1695,18 +1791,19 @@ class PerpTradeHistoryRetriever {
     };
     
     // Helper function to close a trade
-    const closeTrade = (trade: PerpTradeGroup, exitFill: PerpTradeData) => {
+    const closeTrade = (trade: PerpTradeGroup) => {
       // Get calculation data for this trade
       const calcData = tradeCalculationData.get(trade.tradeId);
       if (!calcData) {
         tradeCalculationData.set(trade.tradeId, { entryFills: [], exitFills: [] });
       }
       const data = tradeCalculationData.get(trade.tradeId)!;
-      
-      // Add final exit fill
-      data.exitFills.push(exitFill);
-      trade.exitPrice = calculateWeightedPrice(data.exitFills);
-      trade.exitTime = exitFill.timeString;
+
+      const latestExitFill = data.exitFills[data.exitFills.length - 1];
+      if (data.exitFills.length > 0) {
+        trade.exitPrice = calculateWeightedPrice(data.exitFills);
+        trade.exitTime = latestExitFill.timeString;
+      }
       trade.exitNotionalValue = trade.peakQuantity * (trade.exitPrice || 0);
       trade.status = 'closed';
       
@@ -1719,6 +1816,26 @@ class PerpTradeHistoryRetriever {
       
       console.log(`     🔴 Closing ${trade.direction} trade: ${trade.tradeId} | Peak: ${trade.peakQuantity} SOL | PnL: ${trade.realizedPnL?.toFixed(4)} USDC (${trade.realizedPnLPercent?.toFixed(2)}%)`);
       return trade;
+    };
+
+    const splitFill = (
+      fill: PerpTradeData,
+      quantity: number,
+      leg: 'close' | 'open'
+    ): PerpTradeData => {
+      if (fill.quantity <= 0) {
+        return { ...fill, tradeId: `${fill.tradeId}-${leg}`, quantity };
+      }
+      const ratio = quantity / fill.quantity;
+      return {
+        ...fill,
+        tradeId: `${fill.tradeId}-${leg}`,
+        quantity,
+        notionalValue: quantity * fill.price,
+        fees: fill.fees * ratio,
+        rebates: fill.rebates * ratio,
+        marginUsed: fill.marginUsed !== undefined ? fill.marginUsed * ratio : fill.marginUsed
+      };
     };
     
     // Helper function to create new trade
@@ -1790,7 +1907,7 @@ class PerpTradeHistoryRetriever {
         // Closing position exactly to zero
         const trade = position.openTrade;
         updateTradeWithFill(trade, fill, newBalance); // Add the exit fill to the trade
-        const closedTrade = closeTrade(trade, fill);
+        closeTrade(trade);
         position.openTrade = null;
         
       } else if (crossesZero && position.openTrade) {
@@ -1800,30 +1917,17 @@ class PerpTradeHistoryRetriever {
         // Calculate how much closes current position and how much opens new position
         const closeQuantity = Math.abs(previousBalance);
         const openQuantity = Math.abs(newBalance);
+        const closeFill = splitFill(fill, closeQuantity, 'close');
+        const openFill = splitFill(fill, openQuantity, 'open');
         
         console.log(`     ↩️ Position flip: closing ${closeQuantity} ${currentTrade.direction} + opening ${openQuantity} ${fill.side}`);
-        
-        // Close current trade (add proportional fees for closing portion)
-        currentTrade.totalFees += fill.fees * (closeQuantity / fill.quantity);
-        currentTrade.totalRebates += fill.rebates * (closeQuantity / fill.quantity);
-        currentTrade.netFees = currentTrade.totalFees - currentTrade.totalRebates;
-        
-        const closedTrade = closeTrade(currentTrade, fill);
-        trades.push(closedTrade);
+
+        // Close current trade with the proportional fill leg.
+        updateTradeWithFill(currentTrade, closeFill, 0);
+        closeTrade(currentTrade);
         
         // Open new trade in opposite direction (proportional fees for opening portion)
-        const newTrade = createTrade(fill, openQuantity, instrId);
-        newTrade.totalFees = fill.fees * (openQuantity / fill.quantity);
-        newTrade.totalRebates = fill.rebates * (openQuantity / fill.quantity);
-        newTrade.netFees = newTrade.totalFees - newTrade.totalRebates;
-        newTrade.notionalValue = openQuantity * fill.price;
-        newTrade.peakNotionalValue = newTrade.notionalValue;
-        
-        if (newTrade.leverage && newTrade.leverage > 0) {
-          newTrade.collateralUsed = newTrade.notionalValue / newTrade.leverage;
-          newTrade.peakCollateralUsed = newTrade.collateralUsed;
-        }
-        
+        const newTrade = createTrade(openFill, openQuantity, instrId);
         position.openTrade = newTrade;
         trades.push(newTrade); // Add to trades array immediately
         
@@ -2194,6 +2298,12 @@ async function main() {
   let backfill3m = false;
   let chunkDays = 1;
   let makerPaddingMinutes = 15;
+  let touchGuidedMaker = true;
+  let touchToleranceBps = 0;
+  let touchHorizonsHours: number[] = [6];
+  let touchMaxWindowsPerPass = 8;
+  let maxDeepMakerPasses = 0;
+  let unanchoredScanMaxPages = 40;
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
@@ -2287,6 +2397,60 @@ async function main() {
       i++;
       continue;
     }
+    if (arg === '--no-touch-guided-maker') {
+      touchGuidedMaker = false;
+      continue;
+    }
+    if (arg === '--touch-tolerance-bps') {
+      const parsed = Number(args[i + 1]);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        console.error(`❌ Invalid --touch-tolerance-bps value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      touchToleranceBps = parsed;
+      i++;
+      continue;
+    }
+    if (arg === '--touch-horizons-hours') {
+      const raw = (args[i + 1] || '').split(',').map(part => Number(part.trim())).filter(Number.isFinite);
+      if (raw.length === 0 || raw.some(value => value <= 0)) {
+        console.error(`❌ Invalid --touch-horizons-hours value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      touchHorizonsHours = Array.from(new Set(raw)).sort((a, b) => a - b);
+      i++;
+      continue;
+    }
+    if (arg === '--touch-max-windows') {
+      const parsed = Number(args[i + 1]);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.error(`❌ Invalid --touch-max-windows value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      touchMaxWindowsPerPass = Math.floor(parsed);
+      i++;
+      continue;
+    }
+    if (arg === '--max-deep-maker-passes') {
+      const parsed = Number(args[i + 1]);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        console.error(`❌ Invalid --max-deep-maker-passes value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      maxDeepMakerPasses = Math.floor(parsed);
+      i++;
+      continue;
+    }
+    if (arg === '--unanchored-scan-max-pages') {
+      const parsed = Number(args[i + 1]);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        console.error(`❌ Invalid --unanchored-scan-max-pages value: ${args[i + 1]}`);
+        process.exit(1);
+      }
+      unanchoredScanMaxPages = Math.max(1, Math.floor(parsed));
+      i++;
+      continue;
+    }
     // Backwards compatibility: treat a second positional arg as custom RPC
     if (!arg.startsWith('-') && !customRpc) {
       customRpc = arg;
@@ -2314,6 +2478,12 @@ async function main() {
     console.error('    --backfill-3m         Run chunked 3-month backfill and merge to one output');
     console.error('    --chunk-days <n>      Chunk size in days for backfill mode (default: 1)');
     console.error('    --maker-padding-minutes <n>  Program-scan padding around wallet activity (default: 15)');
+    console.error('    --no-touch-guided-maker Disable Binance touch-guided maker window refinement');
+    console.error('    --touch-horizons-hours <csv> Touch horizons in hours (default: 6)');
+    console.error('    --touch-tolerance-bps <n> Price touch tolerance in bps (default: 0)');
+    console.error('    --touch-max-windows <n> Cap merged touch windows per pass (default: 8)');
+    console.error('    --max-deep-maker-passes <n> Number of deep fallback passes to run (default: 0)');
+    console.error('    --unanchored-scan-max-pages <n> Cap program-scan pages when no `before` anchor exists (default: 40)');
     console.error('Examples:');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ');
     console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ https://devnet.helius-rpc.com');
@@ -2525,14 +2695,6 @@ async function main() {
         ranges.push({ start: chunkStart, end: chunkEnd });
       }
 
-      const progressiveMakerPassMinutes = Array.from(new Set([
-        makerPaddingMinutes,
-        6 * 60,
-        24 * 60,
-        3 * 24 * 60,
-        7 * 24 * 60,
-        28 * 24 * 60
-      ].filter(minutes => minutes >= makerPaddingMinutes))).sort((a, b) => a - b);
       const formatMinutesCompact = (minutes: number): string => {
         if (minutes % (24 * 60) === 0) {
           return `${minutes / (24 * 60)}d`;
@@ -2542,13 +2704,220 @@ async function main() {
         }
         return `${minutes}m`;
       };
+      const localMakerPassMinutes = Array.from(new Set([
+        makerPaddingMinutes,
+        60,
+        3 * 60
+      ].filter(minutes => minutes >= makerPaddingMinutes))).sort((a, b) => a - b);
+      const localMakerUpperBoundMinutes = localMakerPassMinutes.length > 0
+        ? localMakerPassMinutes[localMakerPassMinutes.length - 1]
+        : makerPaddingMinutes;
+      const deepMakerPassMinutes = Array.from(new Set([
+        6 * 60,
+        24 * 60,
+        3 * 24 * 60,
+        7 * 24 * 60,
+        28 * 24 * 60
+      ].filter(minutes => minutes > localMakerUpperBoundMinutes))).sort((a, b) => a - b);
+      const activeDeepMakerPassMinutes = deepMakerPassMinutes.slice(0, Math.max(0, maxDeepMakerPasses));
+      const touchHorizonMinutes = touchHorizonsHours
+        .map(hours => Math.round(hours * 60))
+        .filter(minutes => minutes > 0)
+        .sort((a, b) => a - b);
+      const touchWindowProfiles = [
+        { label: 'tight', beforeMinutes: 2, afterMinutes: 5 },
+        { label: 'expanded', beforeMinutes: 5, afterMinutes: 15 }
+      ];
 
       console.log(
         `🧱 Backfill mode enabled: ${ranges.length} chunks (${chunkDays} day/chunk, ` +
-        `maker passes ${progressiveMakerPassMinutes.map(formatMinutesCompact).join(' -> ')})`
+        `local maker ${localMakerPassMinutes.map(formatMinutesCompact).join(' -> ') || 'none'}, ` +
+        `touch-guided=${touchGuidedMaker ? `on (${touchHorizonsHours.join(',')}h)` : 'off'}, ` +
+        `deep maker ${activeDeepMakerPassMinutes.map(formatMinutesCompact).join(' -> ') || 'none'})`
       );
       const noActivity = (error: any): boolean =>
         String(error?.message || error).includes('no Deriverse trading activity');
+      const mergeWindows = (rawWindows: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> => {
+        const sorted = rawWindows
+          .filter(window => window.start <= window.end)
+          .sort((a, b) => a.start - b.start);
+        const merged: Array<{ start: number; end: number }> = [];
+        for (const window of sorted) {
+          const previous = merged[merged.length - 1];
+          if (!previous || window.start > previous.end + 1000) {
+            merged.push({ ...window });
+          } else {
+            previous.end = Math.max(previous.end, window.end);
+          }
+        }
+        return merged;
+      };
+      const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+      const binanceKlineCache = new Map<string, Array<{ openTime: number; high: number; low: number }>>();
+
+      const fetchBinanceMinuteCandles = async (
+        startMs: number,
+        endMs: number
+      ): Promise<Array<{ openTime: number; high: number; low: number }>> => {
+        if (endMs <= startMs) {
+          return [];
+        }
+        const startAligned = Math.floor(startMs / 60000) * 60000;
+        const endAligned = Math.floor(endMs / 60000) * 60000;
+        const cacheKey = `${startAligned}:${endAligned}`;
+        const cached = binanceKlineCache.get(cacheKey);
+        if (cached) {
+          return cached;
+        }
+
+        const candles: Array<{ openTime: number; high: number; low: number }> = [];
+        let cursor = startAligned;
+        let requestCount = 0;
+        while (cursor <= endAligned) {
+          requestCount++;
+          if (requestCount > 500) {
+            break;
+          }
+          const query = new URLSearchParams({
+            symbol: 'SOLUSDT',
+            interval: '1m',
+            limit: '1000',
+            startTime: String(cursor),
+            endTime: String(endAligned)
+          });
+          const response = await fetch(`https://api.binance.com/api/v3/klines?${query.toString()}`);
+          if (!response.ok) {
+            throw new Error(`Binance klines request failed: HTTP ${response.status}`);
+          }
+          const rows = await response.json();
+          if (!Array.isArray(rows) || rows.length === 0) {
+            break;
+          }
+          for (const row of rows) {
+            const openTime = Number(row?.[0]);
+            const high = Number(row?.[2]);
+            const low = Number(row?.[3]);
+            if (!Number.isFinite(openTime) || !Number.isFinite(high) || !Number.isFinite(low)) {
+              continue;
+            }
+            if (openTime < startAligned || openTime > endAligned) {
+              continue;
+            }
+            candles.push({ openTime, high, low });
+          }
+          const lastOpenTime = Number(rows[rows.length - 1]?.[0]);
+          if (!Number.isFinite(lastOpenTime)) {
+            break;
+          }
+          cursor = lastOpenTime + 60000;
+          if (rows.length < 1000) {
+            break;
+          }
+          await sleep(50);
+        }
+
+        const deduped = Array.from(
+          new Map(candles.map(c => [c.openTime, c])).values()
+        ).sort((a, b) => a.openTime - b.openTime);
+        binanceKlineCache.set(cacheKey, deduped);
+        return deduped;
+      };
+
+      const pickTouchTimes = (
+        placeEvent: PerpTradeData,
+        candles: Array<{ openTime: number; high: number; low: number }>,
+        maxTouches = 12
+      ): number[] => {
+        if (placeEvent.side !== 'long' && placeEvent.side !== 'short') {
+          return [];
+        }
+        const limitPrice = Number(placeEvent.price);
+        if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
+          return [];
+        }
+
+        const tolerance = touchToleranceBps / 10000;
+        const thresholdForBuy = limitPrice * (1 + tolerance);
+        const thresholdForSell = limitPrice * (1 - tolerance);
+        const touched: number[] = [];
+        for (const candle of candles) {
+          const hit = placeEvent.side === 'long'
+            ? candle.low <= thresholdForBuy
+            : candle.high >= thresholdForSell;
+          if (hit) {
+            touched.push(candle.openTime);
+          }
+        }
+        if (touched.length === 0) {
+          return [];
+        }
+
+        const clustered: number[] = [];
+        let last = Number.NEGATIVE_INFINITY;
+        for (const ts of touched) {
+          if (ts - last > 3 * 60000) {
+            clustered.push(ts);
+          }
+          last = ts;
+        }
+        if (clustered.length <= maxTouches) {
+          return clustered;
+        }
+
+        const sampled: number[] = [];
+        const step = (clustered.length - 1) / (maxTouches - 1);
+        for (let i = 0; i < maxTouches; i++) {
+          sampled.push(clustered[Math.round(i * step)]);
+        }
+        return Array.from(new Set(sampled));
+      };
+
+      const buildTouchGuidedWindows = async (
+        unresolvedPlaceEvents: PerpTradeData[],
+        windowRangeStart: number,
+        windowRangeEnd: number,
+        horizonMinutes: number,
+        beforeMinutes: number,
+        afterMinutes: number
+      ): Promise<{ windows: Array<{ start: number; end: number }>; touchedOrders: number; touchPoints: number }> => {
+        const rawWindows: Array<{ start: number; end: number }> = [];
+        let touchedOrders = 0;
+        let touchPoints = 0;
+
+        for (const event of unresolvedPlaceEvents) {
+          const touchSearchStart = Math.max(windowRangeStart, event.timestamp);
+          const touchSearchEnd = Math.min(windowRangeEnd, event.timestamp + horizonMinutes * 60000);
+          if (touchSearchEnd <= touchSearchStart) {
+            continue;
+          }
+          let candles: Array<{ openTime: number; high: number; low: number }>;
+          try {
+            candles = await fetchBinanceMinuteCandles(touchSearchStart, touchSearchEnd);
+          } catch (error: any) {
+            console.log(`   ⚠️ Binance touch prefilter failed (${error?.message || error}), skipping touch-guided pass.`);
+            return { windows: [], touchedOrders: 0, touchPoints: 0 };
+          }
+          const touchTimes = pickTouchTimes(event, candles);
+          if (touchTimes.length === 0) {
+            continue;
+          }
+          touchedOrders++;
+          touchPoints += touchTimes.length;
+          for (const touchTs of touchTimes) {
+            rawWindows.push({
+              start: Math.max(windowRangeStart, touchTs - beforeMinutes * 60000),
+              end: Math.min(windowRangeEnd, touchTs + afterMinutes * 60000)
+            });
+          }
+        }
+
+        let windows = mergeWindows(rawWindows);
+        if (windows.length > touchMaxWindowsPerPass) {
+          windows = windows.slice(0, touchMaxWindowsPerPass);
+        }
+
+        return { windows, touchedOrders, touchPoints };
+      };
 
       const walletSignatures = await collectWalletSignatures(walletAddress, startDate, endDate);
       const walletTimes = walletSignatures.map(item => item.blockTimeMs);
@@ -2595,11 +2964,13 @@ async function main() {
         let chunkHistory = baseHistory;
         if (includeProgramScan && baseHistory.tradeHistory.length > 0) {
           const getUnresolvedPlaceEvents = (history: PerpTradingHistory): PerpTradeData[] => {
-            const fillSignatures = new Set(
-              history.filledOrders.map(fill => fill.tradeId.split('-')[0])
-            );
             const filledOrderIds = new Set(
               history.filledOrders.map(fill => fill.orderId.toString())
+            );
+            const takerFillSignatures = new Set(
+              history.filledOrders
+                .filter(fill => fill.role === 'taker')
+                .map(fill => String(fill.tradeId).split('-')[0])
             );
             const canceledOrderIds = new Set(
               history.tradeHistory
@@ -2608,29 +2979,13 @@ async function main() {
             );
             return history.tradeHistory.filter(event => {
               if (event.type !== 'place') return false;
-              const signature = event.tradeId.split('-')[0];
-              if (fillSignatures.has(signature)) return false;
               const orderId = event.orderId.toString();
+              const eventSignature = String(event.tradeId).split('-')[0];
+              if (takerFillSignatures.has(eventSignature)) return false;
               if (filledOrderIds.has(orderId)) return false;
               if (canceledOrderIds.has(orderId)) return false;
               return true;
             });
-          };
-
-          const mergeWindows = (rawWindows: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> => {
-            const sorted = rawWindows
-              .filter(window => window.start <= window.end)
-              .sort((a, b) => a.start - b.start);
-            const merged: Array<{ start: number; end: number }> = [];
-            for (const window of sorted) {
-              const previous = merged[merged.length - 1];
-              if (!previous || window.start > previous.end + 1000) {
-                merged.push({ ...window });
-              } else {
-                previous.end = Math.max(previous.end, window.end);
-              }
-            }
-            return merged;
           };
 
           const resolveAnchorsForWindow = (
@@ -2653,77 +3008,214 @@ async function main() {
             }
             return { before, until };
           };
+          const runRefinementWindows = async (
+            strategyLabel: string,
+            windows: Array<{ start: number; end: number }>
+          ): Promise<{ activityWindows: number; fillEvents: number }> => {
+            if (windows.length === 0) {
+              return { activityWindows: 0, fillEvents: 0 };
+            }
+            let activityWindows = 0;
+            let fillEvents = 0;
+            for (const window of windows) {
+              const scanStart = new Date(window.start);
+              const scanEnd = new Date(window.end);
+              const anchors = resolveAnchorsForWindow(window.start, window.end);
+              const maxPagesForWindow = anchors.before ? undefined : unanchoredScanMaxPages;
+              console.log(`      • [${strategyLabel}] ${scanStart.toISOString()} → ${scanEnd.toISOString()}`);
+              if (anchors.before || anchors.until) {
+                console.log(
+                  `      • scan anchors before=${anchors.before?.slice(0, 8) || 'none'} ` +
+                  `until=${anchors.until?.slice(0, 8) || 'none'}`
+                );
+              }
+              if (maxPagesForWindow !== undefined) {
+                console.log(`      • scan page cap (no before anchor): ${maxPagesForWindow}`);
+              }
+
+              retriever.setDateRange(scanStart, scanEnd);
+              try {
+                const refinedHistory = await retriever.fetchPerpTradeHistory(walletAddress, {
+                  includeProgramScan: true,
+                  disableProgramScanCheckpoint: true,
+                  programScanBeforeSignature: anchors.before,
+                  programScanUntilSignature: anchors.until,
+                  programScanMaxPages: maxPagesForWindow
+                });
+                const hasActivity =
+                  refinedHistory.tradeHistory.length > 0 ||
+                  refinedHistory.filledOrders.length > 0 ||
+                  refinedHistory.fundingHistory.length > 0 ||
+                  refinedHistory.depositWithdrawHistory.length > 0;
+                if (hasActivity) {
+                  activityWindows++;
+                }
+                fillEvents += refinedHistory.filledOrders.length;
+                chunkHistory = retriever.mergeHistoryChunks(walletAddress, [chunkHistory, refinedHistory], {
+                  start: range.start,
+                  end: range.end
+                });
+              } catch (error: any) {
+                console.log(`      ⚠️ Refinement window failed, continuing: ${error?.message || error}`);
+              }
+            }
+            return { activityWindows, fillEvents };
+          };
 
           const initialUnresolved = getUnresolvedPlaceEvents(baseHistory);
           if (initialUnresolved.length > 0) {
             console.log(
               `   🔬 Program-scan refinement started with ${initialUnresolved.length} unresolved place events`
             );
+            const chunkStartMs = range.start.getTime();
+            const chunkEndMs = range.end.getTime();
+            let previousUpperMinutes = makerPaddingMinutes;
 
-            const paddingMs = makerPaddingMinutes * 60 * 1000;
-            for (let passIndex = 0; passIndex < progressiveMakerPassMinutes.length; passIndex++) {
+            // Stage 1: Keep local windows small and cheap first.
+            for (let passIndex = 0; passIndex < localMakerPassMinutes.length; passIndex++) {
               const unresolvedPlaceEvents = getUnresolvedPlaceEvents(chunkHistory);
               if (unresolvedPlaceEvents.length === 0) {
-                console.log(`   ✅ Maker refinement complete after pass ${passIndex}`);
+                console.log(`   ✅ Maker refinement complete after local pass ${passIndex}`);
                 break;
               }
 
-              const passMaxMinutes = progressiveMakerPassMinutes[passIndex];
-              const previousPassMinutes = passIndex > 0 ? progressiveMakerPassMinutes[passIndex - 1] : makerPaddingMinutes;
+              const passMaxMinutes = localMakerPassMinutes[passIndex];
               const rawWindows = unresolvedPlaceEvents.map(event => {
                 const start = passIndex === 0
-                  ? event.timestamp - paddingMs
-                  : event.timestamp + previousPassMinutes * 60 * 1000 + 1000;
-                const end = event.timestamp + passMaxMinutes * 60 * 1000;
+                  ? event.timestamp - makerPaddingMinutes * 60000
+                  : event.timestamp + previousUpperMinutes * 60000 + 1000;
+                const end = event.timestamp + passMaxMinutes * 60000;
                 return {
-                  start: Math.max(range.start.getTime(), start),
-                  end: Math.min(range.end.getTime(), end)
+                  start: Math.max(chunkStartMs, start),
+                  end: Math.min(chunkEndMs, end)
                 };
               });
               const mergedWindows = mergeWindows(rawWindows);
+              previousUpperMinutes = passMaxMinutes;
               if (mergedWindows.length === 0) {
                 continue;
               }
 
               const passLabel = passIndex === 0
                 ? `±${formatMinutesCompact(makerPaddingMinutes)}`
-                : `${formatMinutesCompact(previousPassMinutes)} -> ${formatMinutesCompact(passMaxMinutes)} after place`;
+                : `${formatMinutesCompact(localMakerPassMinutes[passIndex - 1])} -> ${formatMinutesCompact(passMaxMinutes)} after place`;
               console.log(
-                `   🔁 Maker refinement pass ${passIndex + 1}/${progressiveMakerPassMinutes.length} ` +
+                `   🔁 Local maker pass ${passIndex + 1}/${localMakerPassMinutes.length} ` +
                 `(${passLabel}): ${mergedWindows.length} windows from ${unresolvedPlaceEvents.length} unresolved places`
               );
-
-              for (const window of mergedWindows) {
-                const scanStart = new Date(window.start);
-                const scanEnd = new Date(window.end);
-                const anchors = resolveAnchorsForWindow(window.start, window.end);
-                console.log(`      • ${scanStart.toISOString()} → ${scanEnd.toISOString()}`);
-                if (anchors.before || anchors.until) {
-                  console.log(
-                    `      • scan anchors before=${anchors.before?.slice(0, 8) || 'none'} ` +
-                    `until=${anchors.until?.slice(0, 8) || 'none'}`
-                  );
-                }
-
-                retriever.setDateRange(scanStart, scanEnd);
-                try {
-                  const refinedHistory = await retriever.fetchPerpTradeHistory(walletAddress, {
-                    includeProgramScan: true,
-                    disableProgramScanCheckpoint: true,
-                    programScanBeforeSignature: anchors.before,
-                    programScanUntilSignature: anchors.until
-                  });
-                  chunkHistory = retriever.mergeHistoryChunks(walletAddress, [chunkHistory, refinedHistory], {
-                    start: range.start,
-                    end: range.end
-                  });
-                } catch (error: any) {
-                  console.log(`      ⚠️ Refinement window failed, continuing: ${error?.message || error}`);
-                }
-              }
+              const refinementSummary = await runRefinementWindows(`local-${passIndex + 1}`, mergedWindows);
 
               const unresolvedAfterPass = getUnresolvedPlaceEvents(chunkHistory).length;
-              console.log(`   ↪️ Unresolved places after pass ${passIndex + 1}: ${unresolvedAfterPass}`);
+              console.log(`   ↪️ Unresolved places after local pass ${passIndex + 1}: ${unresolvedAfterPass}`);
+              if (
+                passIndex > 0 &&
+                refinementSummary.activityWindows === 0 &&
+                unresolvedAfterPass === unresolvedPlaceEvents.length
+              ) {
+                console.log(
+                  `   ℹ️ Local pass ${passIndex + 1} had no on-chain activity and made no progress; ` +
+                  `skipping remaining local passes.`
+                );
+                break;
+              }
+            }
+
+            // Stage 2: Use Binance touch-guided windows before expensive deep scans.
+            if (touchGuidedMaker) {
+              const seenTouchWindowKeys = new Set<string>();
+              let touchStageImproved = false;
+              for (const profile of touchWindowProfiles) {
+                let stopTouchStage = false;
+                let profileImproved = false;
+                for (const horizonMinutes of touchHorizonMinutes) {
+                  const unresolvedPlaceEvents = getUnresolvedPlaceEvents(chunkHistory);
+                  if (unresolvedPlaceEvents.length === 0) {
+                    stopTouchStage = true;
+                    break;
+                  }
+                  const unresolvedBeforeTouchPass = unresolvedPlaceEvents.length;
+                  const touchResult = await buildTouchGuidedWindows(
+                    unresolvedPlaceEvents,
+                    chunkStartMs,
+                    chunkEndMs,
+                    horizonMinutes,
+                    profile.beforeMinutes,
+                    profile.afterMinutes
+                  );
+                  if (touchResult.windows.length === 0) {
+                    console.log(
+                      `   ℹ️ Touch-guided ${profile.label} (${formatMinutesCompact(horizonMinutes)} horizon) ` +
+                      `found no touch windows for ${unresolvedPlaceEvents.length} unresolved places`
+                    );
+                    continue;
+                  }
+                  const touchWindowKey = touchResult.windows.map(window => `${window.start}-${window.end}`).join('|');
+                  if (touchWindowKey && seenTouchWindowKeys.has(touchWindowKey)) {
+                    console.log(
+                      `   ℹ️ Touch-guided ${profile.label} (${formatMinutesCompact(horizonMinutes)} horizon) ` +
+                      `generated duplicate windows, skipping`
+                    );
+                    continue;
+                  }
+                  if (touchWindowKey) {
+                    seenTouchWindowKeys.add(touchWindowKey);
+                  }
+                  console.log(
+                    `   🛰️ Touch-guided ${profile.label} (${formatMinutesCompact(horizonMinutes)} horizon): ` +
+                    `${touchResult.windows.length} windows from ${touchResult.touchedOrders}/${unresolvedPlaceEvents.length} touched places ` +
+                    `(${touchResult.touchPoints} touch points)`
+                  );
+                  await runRefinementWindows(`touch-${profile.label}-${formatMinutesCompact(horizonMinutes)}`, touchResult.windows);
+                  const unresolvedAfterTouchPass = getUnresolvedPlaceEvents(chunkHistory).length;
+                  console.log(
+                    `   ↪️ Unresolved places after touch-guided ${profile.label} (${formatMinutesCompact(horizonMinutes)}): ` +
+                    `${unresolvedAfterTouchPass}`
+                  );
+                  if (unresolvedAfterTouchPass < unresolvedBeforeTouchPass) {
+                    profileImproved = true;
+                    touchStageImproved = true;
+                  }
+                }
+                if (!profileImproved && !stopTouchStage) {
+                  console.log(`   ℹ️ Touch-guided profile "${profile.label}" made no progress; moving on.`);
+                }
+                if (stopTouchStage || getUnresolvedPlaceEvents(chunkHistory).length === 0) {
+                  break;
+                }
+              }
+              if (!touchStageImproved && getUnresolvedPlaceEvents(chunkHistory).length > 0) {
+                console.log('   ℹ️ Touch-guided stage found no additional fills; continuing to deep fallback.');
+              }
+            } else {
+              console.log('   ℹ️ Touch-guided maker refinement disabled (--no-touch-guided-maker)');
+            }
+
+            // Stage 3: Deep fallback only if unresolved orders remain.
+            previousUpperMinutes = Math.max(previousUpperMinutes, localMakerUpperBoundMinutes);
+            for (let passIndex = 0; passIndex < activeDeepMakerPassMinutes.length; passIndex++) {
+              const unresolvedPlaceEvents = getUnresolvedPlaceEvents(chunkHistory);
+              if (unresolvedPlaceEvents.length === 0) {
+                break;
+              }
+              const passMaxMinutes = activeDeepMakerPassMinutes[passIndex];
+              const rawWindows = unresolvedPlaceEvents.map(event => ({
+                start: Math.max(chunkStartMs, event.timestamp + previousUpperMinutes * 60000 + 1000),
+                end: Math.min(chunkEndMs, event.timestamp + passMaxMinutes * 60000)
+              }));
+              const mergedWindows = mergeWindows(rawWindows);
+              if (mergedWindows.length === 0) {
+                previousUpperMinutes = passMaxMinutes;
+                continue;
+              }
+              console.log(
+                `   🧭 Deep maker pass ${passIndex + 1}/${activeDeepMakerPassMinutes.length} ` +
+                `(${formatMinutesCompact(previousUpperMinutes)} -> ${formatMinutesCompact(passMaxMinutes)}): ` +
+                `${mergedWindows.length} windows from ${unresolvedPlaceEvents.length} unresolved places`
+              );
+              await runRefinementWindows(`deep-${passIndex + 1}`, mergedWindows);
+              previousUpperMinutes = passMaxMinutes;
+              const unresolvedAfterPass = getUnresolvedPlaceEvents(chunkHistory).length;
+              console.log(`   ↪️ Unresolved places after deep pass ${passIndex + 1}: ${unresolvedAfterPass}`);
             }
 
             const unresolvedRemaining = getUnresolvedPlaceEvents(chunkHistory).length;

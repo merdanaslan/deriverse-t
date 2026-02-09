@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "ts-node perpTradeHistory.ts",
     "start": "npx ts-node perpTradeHistory.ts",
-    "build": "tsc --skipLibCheck perpTradeHistory.ts",
-    "compile": "tsc --skipLibCheck --outDir dist perpTradeHistory.ts"
+    "build": "tsc -p tsconfig.json --skipLibCheck",
+    "compile": "tsc -p tsconfig.json --skipLibCheck --noEmit false --outDir dist"
   },
   "dependencies": {
     "@deriverse/kit": "^1.0.32",

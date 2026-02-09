@@ -67,10 +67,18 @@ Notes:
 - Use `--backfill-3m` for a one-time historical bootstrap; it merges chunk outputs into one final JSON.
 - Backfill uses a wallet-activity-first strategy:
   - First pass per chunk: wallet/client fetch only (cheap).
-  - Progressive maker refinement on active chunks:
-    - pass 1: `±maker-padding-minutes` around unresolved place events (default `±15m`)
-    - pass 2+: only if still unresolved, expand forward windows (`6h`, `1d`, `3d`, `7d`, `28d`)
+  - Local maker refinement first: `±maker-padding-minutes`, then `+1h`, then `+3h`.
+  - Touch-guided refinement next (default on): Binance `SOLUSDT` `1m` touches -> tight on-chain windows.
+  - Deep maker scan last fallback: `6h`, `1d`, `3d`, `7d`, `28d`.
 - Tune with `--chunk-days <n>` and `--maker-padding-minutes <n>`.
+- Touch-guided options:
+  - `--no-touch-guided-maker`
+  - `--touch-horizons-hours <csv>` (default: `6`)
+  - `--touch-tolerance-bps <n>` (default: `0`)
+  - `--touch-max-windows <n>` (default: `8`)
+  - `--max-deep-maker-passes <n>` (default: `0`)
+- Runtime guard:
+  - `--unanchored-scan-max-pages <n>` caps program pages when a refinement window has no `before` anchor (default: `40`).
 - Devnet history is limited by provider retention. Run this periodically (e.g. every 10–12 days) to avoid gaps.
 - Use `--helius-rpc <url>` if you want to pass a full endpoint directly.
 - You can also create `.env` based on `.env.example` with `HELIUS_RPC_URL` or `HELIUS_API_KEY`.
