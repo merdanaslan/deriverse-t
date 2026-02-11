@@ -175,11 +175,17 @@ class PerpTradeHistoryRetriever {
   private connection: Connection;
   private rpcUrl: string;
   private batchGetTransactionSupported: boolean | null = null;
+  private getTransactionsMethodSupported: boolean | null = null;
   private startDate: Date;
   private endDate: Date;
   private leverageTimeline: Map<number, Array<{timestamp: number, leverage: number}>> = new Map();
   private userClientId?: number;
   private clientPDA?: string;
+  private transactionCache = new Map<string, any | null>();
+  private transactionInFlight = new Map<string, Promise<any | null>>();
+  private signaturePageCache = new Map<string, any[]>();
+  private readonly maxTransactionCacheEntries = 80000;
+  private readonly maxSignaturePageCacheEntries = 4000;
 
   constructor(rpcUrl: string = 'https://api.devnet.solana.com', startDate?: Date, endDate?: Date) {
     const rpc = createSolanaRpc(rpcUrl);
@@ -211,6 +217,27 @@ class PerpTradeHistoryRetriever {
   setDateRange(startDate: Date, endDate: Date): void {
     this.startDate = startDate;
     this.endDate = endDate;
+  }
+
+  private trimMapCache<K, V>(cache: Map<K, V>, maxEntries: number): void {
+    if (cache.size <= maxEntries) {
+      return;
+    }
+    const keys = cache.keys();
+    const removeCount = Math.floor(maxEntries / 3);
+    for (let i = 0; i < removeCount; i++) {
+      const key = keys.next().value;
+      if (key === undefined) {
+        break;
+      }
+      cache.delete(key);
+    }
+  }
+
+  private buildSignaturePageCacheKey(address: PublicKey, options: any): string {
+    const before = options?.before || 'head';
+    const limit = options?.limit || 1000;
+    return `${address.toString()}|before=${before}|limit=${limit}`;
   }
 
   private deriveClientPrimaryPDA(walletAddress: string): PublicKey {
@@ -294,6 +321,7 @@ class PerpTradeHistoryRetriever {
     options?: {
       logFilePath?: string;
       includeProgramScan?: boolean;
+      skipWalletScan?: boolean;
       programScanCheckpointPath?: string;
       disableProgramScanCheckpoint?: boolean;
       programScanBeforeSignature?: string;
@@ -338,17 +366,23 @@ class PerpTradeHistoryRetriever {
       }
     }
 
-    // Step 1: Get wallet's transaction history
-    console.log('📜 Fetching wallet transaction history...');
-    let deriverseTransactions = await this.getWalletDeriverseTransactions(walletAddress);
+    // Step 1: Get wallet's transaction history (optional for refinement scans).
+    const skipWalletScan = options?.skipWalletScan ?? false;
+    let deriverseTransactions: Array<{ signature: string; blockTime: number; logs: string[]; isUserSigner: boolean }> = [];
+    if (!skipWalletScan) {
+      console.log('📜 Fetching wallet transaction history...');
+      deriverseTransactions = await this.getWalletDeriverseTransactions(walletAddress);
 
-    // Fallback: infer clientId from user-signed tx logs when engine client fetch fails.
-    if (this.userClientId === undefined) {
-      const inferredClientId = this.inferUserClientIdFromTransactions(deriverseTransactions);
-      if (inferredClientId !== undefined) {
-        this.userClientId = inferredClientId;
-        console.log(`🆔 Inferred user clientId from transactions: ${this.userClientId}`);
+      // Fallback: infer clientId from user-signed tx logs when engine client fetch fails.
+      if (this.userClientId === undefined) {
+        const inferredClientId = this.inferUserClientIdFromTransactions(deriverseTransactions);
+        if (inferredClientId !== undefined) {
+          this.userClientId = inferredClientId;
+          console.log(`🆔 Inferred user clientId from transactions: ${this.userClientId}`);
+        }
       }
+    } else {
+      console.log('📜 Skipping wallet signature scan (refinement mode)');
     }
 
     const shouldProgramScan = options?.includeProgramScan ?? true;
@@ -513,6 +547,130 @@ class PerpTradeHistoryRetriever {
     throw new Error(`Failed to fetch tx ${signature} after ${retries} retries`);
   }
 
+  private async fetchTransactionCached(signature: string, retries = 10): Promise<any | null> {
+    if (this.transactionCache.has(signature)) {
+      return this.transactionCache.get(signature) ?? null;
+    }
+    const inFlight = this.transactionInFlight.get(signature);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const request = (async () => {
+      try {
+        const tx = await this.fetchTransactionWithRetry(signature, retries);
+        this.transactionCache.set(signature, tx);
+        this.trimMapCache(this.transactionCache, this.maxTransactionCacheEntries);
+        return tx;
+      } catch {
+        this.transactionCache.set(signature, null);
+        this.trimMapCache(this.transactionCache, this.maxTransactionCacheEntries);
+        return null;
+      } finally {
+        this.transactionInFlight.delete(signature);
+      }
+    })();
+
+    this.transactionInFlight.set(signature, request);
+    return request;
+  }
+
+  private async fetchTransactionsViaGetTransactionsMethod(
+    signatures: string[],
+    retries = 6
+  ): Promise<Array<any | null> | null> {
+    if (signatures.length === 0) {
+      return [];
+    }
+    if (this.getTransactionsMethodSupported === false) {
+      return null;
+    }
+
+    for (let i = 0; i < retries; i++) {
+      try {
+        const payload = {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransactions',
+          params: [
+            signatures,
+            {
+              commitment: 'confirmed',
+              maxSupportedTransactionVersion: 0
+            }
+          ]
+        };
+
+        const response = await fetch(this.rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          if (response.status === 429) {
+            const delay = 350 * Math.pow(2, i);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          if (response.status === 400 || response.status === 403 || response.status === 404) {
+            this.getTransactionsMethodSupported = false;
+            return null;
+          }
+          throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+
+        const json: any = await response.json();
+        if (json?.error) {
+          const message = String(json.error?.message || '');
+          if (
+            message.includes('Method not found') ||
+            message.includes('getTransactions') ||
+            message.includes('unsupported')
+          ) {
+            this.getTransactionsMethodSupported = false;
+            return null;
+          }
+          if (message.includes('Too Many Requests') || message.includes('429')) {
+            const delay = 350 * Math.pow(2, i);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          throw new Error(message || 'Unknown RPC error from getTransactions');
+        }
+
+        const result = Array.isArray(json?.result) ? json.result : [];
+        this.getTransactionsMethodSupported = true;
+        const aligned: Array<any | null> = signatures.map((_, idx) => result[idx] ?? null);
+        for (let idx = 0; idx < signatures.length; idx++) {
+          this.transactionCache.set(signatures[idx], aligned[idx]);
+        }
+        this.trimMapCache(this.transactionCache, this.maxTransactionCacheEntries);
+        return aligned;
+      } catch (error: any) {
+        const message = String(error?.message || error);
+        if (message.includes('429') || message.includes('Too Many Requests')) {
+          const delay = 350 * Math.pow(2, i);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        if (
+          message.includes('Method not found') ||
+          message.includes('getTransactions')
+        ) {
+          this.getTransactionsMethodSupported = false;
+          return null;
+        }
+        if (i === retries - 1) {
+          break;
+        }
+      }
+    }
+
+    // Keep the method enabled for future attempts; this may just be transient.
+    return [];
+  }
+
   private async fetchTransactionsBatch(
     signatures: string[],
     retries = 8,
@@ -522,23 +680,35 @@ class PerpTradeHistoryRetriever {
     if (signatures.length === 0) {
       return [];
     }
-    const fetchIndividually = async (): Promise<Array<any | null>> => {
-      const results: Array<any | null> = new Array(signatures.length).fill(null);
-      const concurrency = Math.min(Math.max(1, Math.floor(maxConcurrency)), signatures.length);
+    const results: Array<any | null> = new Array(signatures.length).fill(null);
+    const unresolvedIndices: number[] = [];
+    for (let i = 0; i < signatures.length; i++) {
+      const cached = this.transactionCache.get(signatures[i]);
+      if (cached !== undefined) {
+        results[i] = cached;
+      } else {
+        unresolvedIndices.push(i);
+      }
+    }
+
+    if (unresolvedIndices.length === 0) {
+      return results;
+    }
+
+    const fetchIndividually = async (indices: number[]): Promise<void> => {
+      const concurrency = Math.min(Math.max(1, Math.floor(maxConcurrency)), indices.length);
       let nextIndex = 0;
 
       const worker = async (): Promise<void> => {
         while (true) {
           const currentIndex = nextIndex;
           nextIndex++;
-          if (currentIndex >= signatures.length) {
+          if (currentIndex >= indices.length) {
             return;
           }
-          try {
-            results[currentIndex] = await this.fetchTransactionWithRetry(signatures[currentIndex], retries);
-          } catch {
-            results[currentIndex] = null;
-          }
+          const signatureIndex = indices[currentIndex];
+          const signature = signatures[signatureIndex];
+          results[signatureIndex] = await this.fetchTransactionCached(signature, retries);
           if (interRequestDelayMs > 0) {
             await new Promise(resolve => setTimeout(resolve, interRequestDelayMs));
           }
@@ -546,20 +716,70 @@ class PerpTradeHistoryRetriever {
       };
 
       await Promise.all(Array.from({ length: concurrency }, () => worker()));
-      return results;
     };
+
+    const unresolvedSignatures = unresolvedIndices.map(index => signatures[index]);
+    const signatureToIndexes = new Map<string, number[]>();
+    for (let i = 0; i < signatures.length; i++) {
+      const key = signatures[i];
+      const list = signatureToIndexes.get(key);
+      if (list) {
+        list.push(i);
+      } else {
+        signatureToIndexes.set(key, [i]);
+      }
+    }
+    const bulkChunkSize = 100;
+    let bulkFetchCompleted = true;
+    for (let i = 0; i < unresolvedSignatures.length; i += bulkChunkSize) {
+      const chunk = unresolvedSignatures.slice(i, i + bulkChunkSize);
+      const bulkResult = await this.fetchTransactionsViaGetTransactionsMethod(chunk, retries);
+      if (bulkResult === null) {
+        bulkFetchCompleted = false;
+        break;
+      }
+      if (bulkResult.length === 0) {
+        bulkFetchCompleted = false;
+        break;
+      }
+      for (let j = 0; j < chunk.length; j++) {
+        const signature = chunk[j];
+        const tx = bulkResult[j] ?? null;
+        const mappedIndexes = signatureToIndexes.get(signature);
+        if (mappedIndexes) {
+          for (const originalIndex of mappedIndexes) {
+            results[originalIndex] = tx;
+          }
+        }
+      }
+      if (i + bulkChunkSize < unresolvedSignatures.length) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    }
+    if (bulkFetchCompleted) {
+      return results;
+    }
+
+    const remainingUnresolvedIndices = unresolvedIndices.filter(
+      index => !this.transactionCache.has(signatures[index])
+    );
+    if (remainingUnresolvedIndices.length === 0) {
+      return results;
+    }
+
     if (this.batchGetTransactionSupported === false) {
-      return fetchIndividually();
+      await fetchIndividually(remainingUnresolvedIndices);
+      return results;
     }
 
     for (let i = 0; i < retries; i++) {
       try {
-        const payload = signatures.map((signature, idx) => ({
+        const payload = remainingUnresolvedIndices.map((signatureIndex, idx) => ({
           jsonrpc: '2.0',
           id: idx,
           method: 'getTransaction',
           params: [
-            signature,
+            signatures[signatureIndex],
             {
               commitment: 'confirmed',
               maxSupportedTransactionVersion: 0
@@ -577,11 +797,13 @@ class PerpTradeHistoryRetriever {
           if (response.status === 403 || response.status === 400) {
             this.batchGetTransactionSupported = false;
             console.log('   ℹ️ RPC batch getTransaction is unavailable on this endpoint, falling back to individual fetch.');
-            return fetchIndividually();
+            await fetchIndividually(remainingUnresolvedIndices);
+            return results;
           }
           if (response.status === 429) {
             this.batchGetTransactionSupported = false;
-            return fetchIndividually();
+            await fetchIndividually(remainingUnresolvedIndices);
+            return results;
           }
           throw new Error(`HTTP ${response.status} ${response.statusText}`);
         }
@@ -590,38 +812,65 @@ class PerpTradeHistoryRetriever {
         if (!Array.isArray(json)) {
           this.batchGetTransactionSupported = false;
           console.log('   ℹ️ RPC batch response format unsupported, falling back to individual fetch.');
-          return fetchIndividually();
+          await fetchIndividually(remainingUnresolvedIndices);
+          return results;
         }
         this.batchGetTransactionSupported = true;
-        const results = json;
+        const rpcResults = json;
         const byId = new Map<number, any>();
-        for (const item of results) {
+        for (const item of rpcResults) {
           if (typeof item?.id === 'number') {
             byId.set(item.id, item.result || null);
           }
         }
-        return signatures.map((_, idx) => byId.get(idx) ?? null);
+        remainingUnresolvedIndices.forEach((signatureIndex, requestIndex) => {
+          const value = byId.get(requestIndex) ?? null;
+          const signature = signatures[signatureIndex];
+          this.transactionCache.set(signature, value);
+          results[signatureIndex] = value;
+        });
+        this.trimMapCache(this.transactionCache, this.maxTransactionCacheEntries);
+        return results;
       } catch (error: any) {
         const message = String(error?.message || error);
         if (message.includes('403') || message.includes('400')) {
           this.batchGetTransactionSupported = false;
-          return fetchIndividually();
+          await fetchIndividually(remainingUnresolvedIndices);
+          return results;
         }
         if (message.includes('429') || message.includes('Too Many Requests')) {
           this.batchGetTransactionSupported = false;
-          return fetchIndividually();
+          await fetchIndividually(remainingUnresolvedIndices);
+          return results;
         }
         throw error;
       }
     }
     this.batchGetTransactionSupported = false;
-    return fetchIndividually();
+    await fetchIndividually(remainingUnresolvedIndices);
+    return results;
   }
 
-  private async getSignaturesWithRetry(address: PublicKey, options: any, retries = 10): Promise<any[]> {
+  private async getSignaturesWithRetry(
+    address: PublicKey,
+    options: any,
+    retries = 10,
+    cacheKey?: string
+  ): Promise<any[]> {
+    if (cacheKey) {
+      const cached = this.signaturePageCache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+    }
     for (let i = 0; i < retries; i++) {
       try {
-        return await this.connection.getSignaturesForAddress(address, options);
+        const signatures = await this.connection.getSignaturesForAddress(address, options);
+        if (cacheKey) {
+          this.signaturePageCache.set(cacheKey, signatures);
+          this.trimMapCache(this.signaturePageCache, this.maxSignaturePageCacheEntries);
+        }
+        return signatures;
       } catch (error: any) {
         if (error.message?.includes('429') || error.toString().includes('429') || error.toString().includes('Too Many Requests')) {
           const delay = 1000 * Math.pow(2, i);
@@ -648,6 +897,7 @@ class PerpTradeHistoryRetriever {
       const allSignaturesMap = new Map<string, any>();
 
       for (const address of addressesToQuery) {
+        const addressPubkey = new PublicKey(address);
         const label = address === walletAddress ? 'wallet' : 'client PDA';
         console.log(`   Using address for signature fetch: ${address} (${label})`);
         console.log(`   Fetching signatures (paginated)...`);
@@ -662,10 +912,13 @@ class PerpTradeHistoryRetriever {
           if (beforeSignature) {
             options.before = beforeSignature;
           }
+          const signaturesCacheKey = this.buildSignaturePageCacheKey(addressPubkey, options);
 
           const signatures = await this.getSignaturesWithRetry(
-            new PublicKey(address),
-            options
+            addressPubkey,
+            options,
+            10,
+            signaturesCacheKey
           );
 
           if (signatures.length === 0) {
@@ -771,7 +1024,7 @@ class PerpTradeHistoryRetriever {
 
         // Small delay to avoid rate limiting
         if (i + batchSize < allSignatures.length) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, 40));
         }
       }
 
@@ -978,8 +1231,9 @@ class PerpTradeHistoryRetriever {
       if (beforeSignature) {
         queryOptions.before = beforeSignature;
       }
+      const signaturesCacheKey = this.buildSignaturePageCacheKey(programAddress, queryOptions);
 
-      const signatures = await this.getSignaturesWithRetry(programAddress, queryOptions);
+      const signatures = await this.getSignaturesWithRetry(programAddress, queryOptions, 10, signaturesCacheKey);
       if (signatures.length === 0) {
         break;
       }
@@ -1026,21 +1280,21 @@ class PerpTradeHistoryRetriever {
       }
 
       if (hasMore) {
-        await new Promise(resolve => setTimeout(resolve, 80));
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
     }
 
     console.log(`   Candidate program signatures in range: ${allSignatures.length}`);
 
     // Free-tier endpoints are sensitive to bursty getTransaction traffic.
-    const batchSize = 8;
+    const batchSize = 20;
     for (let i = 0; i < allSignatures.length; i += batchSize) {
       const batch = allSignatures.slice(i, i + batchSize);
       const transactions = await this.fetchTransactionsBatch(
         batch.map(sig => sig.signature),
         8,
-        1,
-        120
+        2,
+        30
       );
 
       for (let j = 0; j < transactions.length; j++) {
@@ -1080,7 +1334,7 @@ class PerpTradeHistoryRetriever {
       }
 
       if (i + batchSize < allSignatures.length) {
-        await new Promise(resolve => setTimeout(resolve, 150));
+        await new Promise(resolve => setTimeout(resolve, 40));
       }
     }
 
@@ -2282,35 +2536,58 @@ async function main() {
 
   const args = process.argv.slice(2);
   const walletAddress = args[0];
-  let customRpc: string | undefined;
   let listen = false;
   let logFilePath: string | undefined;
   let compareUiPath: string | undefined;
   let uiTimeZone: 'local' | 'utc' = 'utc';
-  let helius = false;
-  let heliusApiKey: string | undefined;
-  let heliusRpcUrl: string | undefined;
   let startDateInput: string | undefined;
   let endDateInput: string | undefined;
-  let includeProgramScan = true;
-  let useProgramScanCheckpoint = true;
-  let programScanCheckpointPath: string | undefined;
-  let backfill3m = false;
-  let chunkDays = 1;
-  let makerPaddingMinutes = 15;
-  let touchGuidedMaker = true;
-  let touchToleranceBps = 0;
-  let touchHorizonsHours: number[] = [6];
-  let touchMaxWindowsPerPass = 8;
-  let maxDeepMakerPasses = 0;
-  let unanchoredScanMaxPages = 40;
+
+  // Simplified default runtime profile (free mode, monthly fetch sweet spot).
+  const includeProgramScan = true;
+  const useProgramScanCheckpoint = true;
+  const programScanCheckpointPath: string | undefined = undefined;
+  const backfill3m = true;
+  const chunkDays = 1;
+  const makerPaddingMinutes = 15;
+  const touchGuidedMaker = true;
+  const touchToleranceBps = 0;
+  const touchHorizonsHours: number[] = [6];
+  const touchMaxWindowsPerPass = 8;
+  const maxDeepMakerPasses = 0;
+  const unanchoredScanMaxPages = 40;
+
+  const printUsage = (): void => {
+    console.error('Usage: npx ts-node perpTradeHistory.ts <wallet-address> [flags]');
+    console.error('Flags:');
+    console.error('  --start <date>        Start date (ISO or YYYY-MM-DD)');
+    console.error('  --end <date>          End date (ISO or YYYY-MM-DD)');
+    console.error('  --compare-ui <path>   Compare fills vs UI orders JSON');
+    console.error('  --ui-timezone <utc|local>  Timezone for UI comparison (default: utc)');
+    console.error('  --listen              Start log capture (WebSocket) for maker fills');
+    console.error('  --log-file <path>     Log capture file (JSONL). Used by --listen');
+    console.error('  --help                Show this help');
+    console.error('Defaults:');
+    console.error('  - 28-day fetch window when --start is not provided');
+    console.error('  - Chunked free-mode backfill pipeline enabled');
+    console.error('  - Program scan + maker refinement enabled');
+    console.error('Examples:');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --start 2026-01-10 --end 2026-02-07 --compare-ui trades-ui/trade-history-extracted.json --ui-timezone utc');
+    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl');
+    console.error('Note: Deriverse is only deployed on Solana devnet');
+  };
+
+  if (walletAddress === '--help' || walletAddress === '-h') {
+    printUsage();
+    return;
+  }
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--rpc') {
-      customRpc = args[i + 1];
-      i++;
-      continue;
+    if (arg === '--help' || arg === '-h') {
+      printUsage();
+      return;
     }
     if (arg === '--start') {
       startDateInput = args[i + 1];
@@ -2346,181 +2623,23 @@ async function main() {
       i++;
       continue;
     }
-    if (arg === '--helius') {
-      helius = true;
-      continue;
-    }
-    if (arg === '--helius-key') {
-      heliusApiKey = args[i + 1];
-      i++;
-      continue;
-    }
-    if (arg === '--helius-rpc') {
-      heliusRpcUrl = args[i + 1];
-      i++;
-      continue;
-    }
-    if (arg === '--no-program-scan') {
-      includeProgramScan = false;
-      continue;
-    }
-    if (arg === '--no-scan-checkpoint') {
-      useProgramScanCheckpoint = false;
-      continue;
-    }
-    if (arg === '--scan-checkpoint-file') {
-      programScanCheckpointPath = args[i + 1];
-      i++;
-      continue;
-    }
-    if (arg === '--backfill-3m') {
-      backfill3m = true;
-      continue;
-    }
-    if (arg === '--chunk-days') {
-      const parsed = Number(args[i + 1]);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        console.error(`❌ Invalid --chunk-days value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      chunkDays = Math.max(0.25, parsed);
-      i++;
-      continue;
-    }
-    if (arg === '--maker-padding-minutes') {
-      const parsed = Number(args[i + 1]);
-      if (!Number.isFinite(parsed) || parsed < 0) {
-        console.error(`❌ Invalid --maker-padding-minutes value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      makerPaddingMinutes = parsed;
-      i++;
-      continue;
-    }
-    if (arg === '--no-touch-guided-maker') {
-      touchGuidedMaker = false;
-      continue;
-    }
-    if (arg === '--touch-tolerance-bps') {
-      const parsed = Number(args[i + 1]);
-      if (!Number.isFinite(parsed) || parsed < 0) {
-        console.error(`❌ Invalid --touch-tolerance-bps value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      touchToleranceBps = parsed;
-      i++;
-      continue;
-    }
-    if (arg === '--touch-horizons-hours') {
-      const raw = (args[i + 1] || '').split(',').map(part => Number(part.trim())).filter(Number.isFinite);
-      if (raw.length === 0 || raw.some(value => value <= 0)) {
-        console.error(`❌ Invalid --touch-horizons-hours value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      touchHorizonsHours = Array.from(new Set(raw)).sort((a, b) => a - b);
-      i++;
-      continue;
-    }
-    if (arg === '--touch-max-windows') {
-      const parsed = Number(args[i + 1]);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        console.error(`❌ Invalid --touch-max-windows value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      touchMaxWindowsPerPass = Math.floor(parsed);
-      i++;
-      continue;
-    }
-    if (arg === '--max-deep-maker-passes') {
-      const parsed = Number(args[i + 1]);
-      if (!Number.isFinite(parsed) || parsed < 0) {
-        console.error(`❌ Invalid --max-deep-maker-passes value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      maxDeepMakerPasses = Math.floor(parsed);
-      i++;
-      continue;
-    }
-    if (arg === '--unanchored-scan-max-pages') {
-      const parsed = Number(args[i + 1]);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        console.error(`❌ Invalid --unanchored-scan-max-pages value: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      unanchoredScanMaxPages = Math.max(1, Math.floor(parsed));
-      i++;
-      continue;
-    }
-    // Backwards compatibility: treat a second positional arg as custom RPC
-    if (!arg.startsWith('-') && !customRpc) {
-      customRpc = arg;
-      continue;
-    }
-  }
-
-  if (!walletAddress) {
-    console.error('Usage: npx ts-node perpTradeHistory.ts <wallet-address> [rpc-endpoint]');
-    console.error('  Flags:');
-    console.error('    --rpc <url>           Custom RPC endpoint');
-    console.error('    --start <date>        Start date (ISO or YYYY-MM-DD)');
-    console.error('    --end <date>          End date (ISO or YYYY-MM-DD)');
-    console.error('    --listen              Start log capture (WebSocket) for maker fills');
-    console.error('    --log-file <path>     Log capture file (JSONL). Used by --listen and --include-logs');
-    console.error('    --include-logs <path> Merge captured logs into history fetch');
-    console.error('    --compare-ui <path>   Compare fills vs UI orders JSON');
-    console.error('    --ui-timezone <local|utc>  Timezone for UI comparison (default: utc)');
-    console.error('    --helius              Use Helius RPC endpoint (free methods only)');
-    console.error('    --helius-key <key>    Helius API key (or set HELIUS_API_KEY)');
-    console.error('    --helius-rpc <url>    Full Helius RPC URL (overrides --helius-key)');
-    console.error('    --no-program-scan     Disable program-wide scan (maker fills may be missed)');
-    console.error('    --no-scan-checkpoint  Disable incremental scan checkpoint');
-    console.error('    --scan-checkpoint-file <path> Custom checkpoint file path');
-    console.error('    --backfill-3m         Run chunked 3-month backfill and merge to one output');
-    console.error('    --chunk-days <n>      Chunk size in days for backfill mode (default: 1)');
-    console.error('    --maker-padding-minutes <n>  Program-scan padding around wallet activity (default: 15)');
-    console.error('    --no-touch-guided-maker Disable Binance touch-guided maker window refinement');
-    console.error('    --touch-horizons-hours <csv> Touch horizons in hours (default: 6)');
-    console.error('    --touch-tolerance-bps <n> Price touch tolerance in bps (default: 0)');
-    console.error('    --touch-max-windows <n> Cap merged touch windows per pass (default: 8)');
-    console.error('    --max-deep-maker-passes <n> Number of deep fallback passes to run (default: 0)');
-    console.error('    --unanchored-scan-max-pages <n> Cap program-scan pages when no `before` anchor exists (default: 40)');
-    console.error('Examples:');
-    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ');
-    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ https://devnet.helius-rpc.com');
-    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl');
-    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --include-logs logs/deriverse-logs.jsonl --compare-ui trades-ui/trade-history-extracted.json');
-    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --start 2025-11-06 --end 2025-12-06');
-    console.error('  npx ts-node perpTradeHistory.ts Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --backfill-3m --compare-ui trades-ui/trade-history-extracted.json');
-    console.error('Note: Deriverse is only deployed on Solana devnet');
+    console.error(`❌ Unknown flag: ${arg}`);
+    printUsage();
     process.exit(1);
   }
 
-  if ((heliusApiKey || heliusRpcUrl) && !customRpc) {
-    helius = true;
-  }
-  if (!helius && !customRpc && (process.env.HELIUS_RPC_URL || process.env.HELIUS_API_KEY)) {
-    helius = true;
+  if (!walletAddress) {
+    printUsage();
+    process.exit(1);
   }
 
-  if (helius) {
-    if (!heliusRpcUrl) {
-      const envRpc = process.env.HELIUS_RPC_URL;
-      if (envRpc) {
-        heliusRpcUrl = envRpc;
-      } else {
-        const key = heliusApiKey || process.env.HELIUS_API_KEY;
-        if (!key) {
-          console.error('❌ Helius enabled but no API key provided. Set HELIUS_RPC_URL/HELIUS_API_KEY or use --helius-key / --helius-rpc.');
-          process.exit(1);
-        }
-        heliusRpcUrl = `https://devnet.helius-rpc.com/?api-key=${key}`;
-      }
-    }
-  }
-
-  // Default to official devnet, but allow custom RPC. Prefer Helius RPC if enabled.
-  const rpcUrl = customRpc || heliusRpcUrl || 'https://api.devnet.solana.com';
-  const usingHeliusRpc = Boolean(heliusRpcUrl && rpcUrl === heliusRpcUrl);
+  // Prefer Helius devnet RPC when configured, otherwise fall back to official devnet.
+  const heliusRpcUrl = process.env.HELIUS_RPC_URL
+    || (process.env.HELIUS_API_KEY
+      ? `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`
+      : undefined);
+  const rpcUrl = heliusRpcUrl || 'https://api.devnet.solana.com';
+  const usingHeliusRpc = Boolean(heliusRpcUrl);
   const defaultLogFile = path.join(process.cwd(), 'logs', `deriverse-logs-${walletAddress.slice(0, 8)}.jsonl`);
   if (!logFilePath && (listen || compareUiPath)) {
     logFilePath = defaultLogFile;
@@ -2539,19 +2658,17 @@ async function main() {
   // Default window keeps free-mode scans practical while covering a useful history horizon.
   const defaultLookbackDays = 28;
   const endDate = parseDate(endDateInput, 'end') || new Date(); // Use current time as end date
-  const explicitStartDate = parseDate(startDateInput, 'start');
-  const backfillStartDate = new Date(endDate.getTime() - 90 * 24 * 60 * 60 * 1000);
-  const startDate = explicitStartDate || (backfill3m ? backfillStartDate : new Date(Date.now() - defaultLookbackDays * 24 * 60 * 60 * 1000));
+  const startDate = parseDate(startDateInput, 'start')
+    || new Date(endDate.getTime() - defaultLookbackDays * 24 * 60 * 60 * 1000);
 
   console.log(`🌐 Using Solana devnet RPC: ${rpcUrl}`);
   if (usingHeliusRpc) {
     console.log(`⚡ Using Helius devnet RPC (free JSON-RPC methods)`);
-  } else if (customRpc) {
-    console.log(`🔧 Custom RPC endpoint specified`);
   } else {
     console.log(`⚡ Using official devnet RPC (may have limitations)`);
   }
   console.log(`📍 Deriverse is only available on devnet`);
+  console.log(`⚙️ Simplified profile: chunked monthly mode (1d chunks, maker padding 15m, touch-guided 6h, deep fallback off)`);
   console.log(`📅 Fetching data from ${startDate.toLocaleDateString()} to ${endDate.toLocaleDateString()}\n`);
 
   const printSummary = (history: PerpTradingHistory): void => {
@@ -3015,9 +3132,10 @@ async function main() {
             if (windows.length === 0) {
               return { activityWindows: 0, fillEvents: 0 };
             }
+            const windowsToScan = mergeWindows(windows);
             let activityWindows = 0;
             let fillEvents = 0;
-            for (const window of windows) {
+            for (const window of windowsToScan) {
               const scanStart = new Date(window.start);
               const scanEnd = new Date(window.end);
               const anchors = resolveAnchorsForWindow(window.start, window.end);
@@ -3036,6 +3154,7 @@ async function main() {
               retriever.setDateRange(scanStart, scanEnd);
               try {
                 const refinedHistory = await retriever.fetchPerpTradeHistory(walletAddress, {
+                  skipWalletScan: true,
                   includeProgramScan: true,
                   disableProgramScanCheckpoint: true,
                   programScanBeforeSignature: anchors.before,

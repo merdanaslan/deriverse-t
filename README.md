@@ -11,16 +11,14 @@ npm run dev <wallet-address>
 # Example
 npm run dev Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
 
-# Helius RPC (free methods) + program scan (historical maker fills)
-# Option A: .env (preferred)
+# Configure free Helius RPC via env (optional but recommended)
+# Option A (.env):
 #   HELIUS_RPC_URL=https://devnet.helius-rpc.com/?api-key=YOUR_KEY
-#   or HELIUS_API_KEY=YOUR_KEY
-# Option B: shell env
-export HELIUS_API_KEY=YOUR_KEY
-npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --start 2025-11-06 --end 2025-12-06
+# Option B:
+#   HELIUS_API_KEY=YOUR_KEY
 
-# Chunked 3-month backfill (free mode) + UI compare
-npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --helius --backfill-3m --chunk-days 1 --compare-ui trades-ui/trade-history-extracted.json
+# Fixed range + UI compare (simplified CLI)
+npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --start 2025-11-06 --end 2025-12-06 --compare-ui trades-ui/trade-history-extracted.json --ui-timezone utc
 
 # Capture maker fills via WebSocket logs (runs continuously)
 npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl
@@ -58,34 +56,30 @@ When maker fills don’t include your wallet or client PDA in account keys, `get
 The script now uses a **free** strategy: scan Deriverse program signatures with standard RPC methods, fetch matching transactions, and filter by `clientId`.
 
 ```bash
-export HELIUS_API_KEY=YOUR_KEY
-npm run dev -- <wallet> --helius --start 2025-11-06 --end 2025-12-06
+npm run dev -- <wallet> --start 2025-11-06 --end 2025-12-06
 ```
 
 Notes:
-- Default fetch window is the last 28 days (set `--start`/`--end` for custom or historical backfills).
-- Use `--backfill-3m` for a one-time historical bootstrap; it merges chunk outputs into one final JSON.
-- Backfill uses a wallet-activity-first strategy:
+- Default fetch window is the last 28 days (set `--start`/`--end` for custom windows).
+- The script always runs the chunked free-mode pipeline internally (no extra flags required).
+- Default runtime profile:
+  - `1` day chunk size
+  - local maker refinement: `±15m`, then `+1h`, then `+3h`
+  - touch-guided refinement: enabled with `6h` horizon
+  - deep maker fallback: disabled by default
+  - unanchored scan guard: `40` pages
+- Chunked flow uses a wallet-activity-first strategy:
   - First pass per chunk: wallet/client fetch only (cheap).
-  - Local maker refinement first: `±maker-padding-minutes`, then `+1h`, then `+3h`.
+  - Local maker refinement first: `±15m`, then `+1h`, then `+3h`.
   - Touch-guided refinement next (default on): Binance `SOLUSDT` `1m` touches -> tight on-chain windows.
   - Deep maker scan last fallback: `6h`, `1d`, `3d`, `7d`, `28d`.
-- Tune with `--chunk-days <n>` and `--maker-padding-minutes <n>`.
-- Touch-guided options:
-  - `--no-touch-guided-maker`
-  - `--touch-horizons-hours <csv>` (default: `6`)
-  - `--touch-tolerance-bps <n>` (default: `0`)
-  - `--touch-max-windows <n>` (default: `8`)
-  - `--max-deep-maker-passes <n>` (default: `0`)
-- Runtime guard:
-  - `--unanchored-scan-max-pages <n>` caps program pages when a refinement window has no `before` anchor (default: `40`).
+- Why long ranges are slower in free mode:
+  - Program scans rely on `getSignaturesForAddress(program, { before })`, which paginates by signature and cannot jump directly to a target timestamp.
+  - Candidate signatures then require `getTransaction` log inspection to filter for wallet/client maker activity.
+  - Larger date ranges therefore increase pagination depth and transaction decode work, so runtime grows with lookback length.
 - Devnet history is limited by provider retention. Run this periodically (e.g. every 10–12 days) to avoid gaps.
-- Use `--helius-rpc <url>` if you want to pass a full endpoint directly.
 - You can also create `.env` based on `.env.example` with `HELIUS_RPC_URL` or `HELIUS_API_KEY`.
-- Program scan is enabled by default and uses a checkpoint file for incremental runs.
-- Use `--no-program-scan` to disable program-wide maker discovery.
-- Use `--no-scan-checkpoint` to force a full rescan.
-- Use `--scan-checkpoint-file <path>` to override the default checkpoint location.
+- Program scan and checkpoints are enabled by default.
 
 ## ✅ UI Match Check
 

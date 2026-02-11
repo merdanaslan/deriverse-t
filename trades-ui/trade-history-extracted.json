@@ -202,5 +202,71 @@
     "price": 82.65,
     "amount": 1,
     "datetime": "2026-02-06 13:29:31"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 83.52,
+    "amount": 1.5,
+    "datetime": "2026-02-09 11:44:40"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 83.29,
+    "amount": 1.5,
+    "datetime": "2026-02-09 11:50:43"
+  },
+  {
+    "action": "Maker Sell",
+    "price": 83.35,
+    "amount": 1,
+    "datetime": "2026-02-09 12:00:36"
+  },
+  {
+    "action": "Maker Buy",
+    "price": 83.66,
+    "amount": 1,
+    "datetime": "2026-02-09 12:08:51"
+  },
+  {
+    "action": "Taker Buy",
+    "price": 83.9,
+    "amount": 2.5,
+    "datetime": "2026-02-09 12:14:51"
+  },
+  {
+    "action": "Maker Buy",
+    "price": 83.89,
+    "amount": 2.5,
+    "datetime": "2026-02-09 12:15:38"
+  },
+  {
+    "action": "Maker Buy",
+    "price": 83.78,
+    "amount": 2.5,
+    "datetime": "2026-02-09 12:18:12"
+  },
+  {
+    "action": "Maker Sell",
+    "price": 84.23,
+    "amount": 2.5,
+    "datetime": "2026-02-09 13:19:32"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 83.85,
+    "amount": 5,
+    "datetime": "2026-02-09 14:01:23"
+  },
+  {
+    "action": "Maker Buy",
+    "price": 83.67,
+    "amount": 1.3,
+    "datetime": "2026-02-09 14:30:38"
+  },
+  {
+    "action": "Taker Sell",
+    "price": 85.07,
+    "amount": 1.3,
+    "datetime": "2026-02-09 15:00:41"
   }
 ]
