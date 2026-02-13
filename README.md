@@ -6,10 +6,10 @@
 
 ```bash
 npm install
-npm run dev <wallet-address>
+npm run dev -- <wallet-address>
 
 # Example
-npm run dev Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
+npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
 
 # Configure free Helius RPC via env (optional but recommended)
 # Option A (.env):
@@ -20,11 +20,11 @@ npm run dev Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ
 # Fixed range + UI compare (simplified CLI)
 npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --start 2025-11-06 --end 2025-12-06 --compare-ui trades-ui/trade-history-extracted.json --ui-timezone utc
 
-# Capture maker fills via WebSocket logs (runs continuously)
-npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --listen --log-file logs/deriverse-logs.jsonl
+# Realtime listener (future events only)
+npm run listen:perp -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --capture-all-perp --client-id 883 --output logs/perp-ws-global-test.jsonl
 
-# Merge captured logs into history + compare vs UI orders
-npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --include-logs logs/deriverse-logs.jsonl --compare-ui trades-ui/trade-history-extracted.json
+# Convert listener JSONL to grouped trade-history JSON
+npm run ws:to-history -- logs/perp-ws-global-test.jsonl --wallet Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --client-id 883
 ```
 
 ## 🔄 Process & Data Flow
@@ -37,18 +37,20 @@ npm run dev -- Cm9aaToERd5g3WshAezKfEW2EgdfcB7FqC7LmTaacigQ --include-logs logs/
 6.  **Group Trades**: Track position balance to group fills into complete trade lifecycles (open → peak → close).
 7.  **Export**: The enhanced data is saved to a JSON file.
 
-## 🧩 Maker Fills (Log Service)
+## 🧩 Maker Fills (Realtime WS Listener)
 
 `getSignaturesForAddress` only covers transactions where the address is a signer, which can miss **maker** fills.  
-To capture maker fills, we subscribe to program logs over WebSocket and persist relevant transactions to a JSONL file.
+To capture maker fills reliably for future activity, subscribe to Deriverse program logs and persist perp events to JSONL.
 
 **Workflow**
-1. Run the log service to capture fills in real time:
-   - `npm run dev -- <wallet> --listen --log-file logs/deriverse-logs.jsonl`
-2. Merge captured logs into historical fetches:
-   - `npm run dev -- <wallet> --include-logs logs/deriverse-logs.jsonl`
+1. Start realtime capture:
+   - `npm run listen:perp -- <wallet> --capture-all-perp --client-id <clientId> --output logs/perp-ws.jsonl`
+2. Stop listener after test/live window.
+3. Convert JSONL to grouped trade JSON:
+   - `npm run ws:to-history -- logs/perp-ws.jsonl --wallet <wallet> --client-id <clientId>`
 
-The log file is a JSONL stream of transactions (`signature`, `blockTime`, `logs`, `isUserSigner`) that can be merged with historical RPC fetches.
+The listener output is JSONL with `listener_start` / `listener_stop` markers and normalized perp event rows.  
+`ws:to-history` converts those rows into the same grouped trade-history schema used by this project.
 
 ## 🛰️ Free Program Scan (Historical Maker Fills)
 
@@ -86,10 +88,12 @@ Notes:
 Use the UI orders JSON (e.g. `trades-ui/trade-history-extracted.json`) to validate matching:
 
 ```bash
-npm run dev -- <wallet> --include-logs logs/deriverse-logs.jsonl --compare-ui trades-ui/trade-history-extracted.json
+npm run dev -- <wallet> --start 2026-01-10 --end 2026-02-07 --compare-ui trades-ui/trade-history-extracted.json --ui-timezone utc
 ```
 
 If timestamps don’t align, try `--ui-timezone utc`.
+
+For realtime listener output, first run `ws:to-history`, then compare the generated JSON against your UI export/screenshots.
 
 > **Note:** The output JSON includes a `rawEvent` field for every entry, containing the full serialized SDK object. This ensures **zero data loss**.
 
@@ -184,7 +188,7 @@ Short 4 SOL:  balance 0 → -4    (opens new short trade)
 
 - **Network**: Devnet only
 - **Trading History**: Wallet must have made at least one Deriverse trade
-- **RPC Access**: Uses public devnet endpoint (no API key needed)
+- **RPC Access**: Public devnet works, but free Helius RPC key is strongly recommended for stability/performance
 - **Node.js**: v16+ required
 
 
