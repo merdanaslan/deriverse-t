@@ -7,6 +7,7 @@
     "dev": "ts-node perpTradeHistory.ts",
     "listen:perp": "ts-node ws-listener/perpWsListener.ts",
     "ws:to-history": "ts-node ws-listener/perpWsToHistory.ts",
+    "worker:deriverse": "ts-node worker/deriverseGlobalWorker.ts",
     "start": "npx ts-node perpTradeHistory.ts",
     "build": "tsc -p tsconfig.json --skipLibCheck",
     "compile": "tsc -p tsconfig.json --skipLibCheck --noEmit false --outDir dist"

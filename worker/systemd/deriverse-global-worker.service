@@ -1,0 +1,18 @@
+[Unit]
+Description=Deriverse Global Listener + Materializer Worker
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/deriverse-t
+EnvironmentFile=/opt/deriverse-t/.env
+ExecStart=/usr/bin/npm run worker:deriverse
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deriverse-global-worker
+
+[Install]
+WantedBy=multi-user.target

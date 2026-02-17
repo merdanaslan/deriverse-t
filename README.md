@@ -208,3 +208,26 @@ The JSON export contains:
 - `depositWithdrawHistory[]` - Account balance changes
 - `positions[]` - Current position snapshots (if available)
 - `summary` - Aggregated statistics and performance metrics
+
+## Always-On Global Worker (Supabase + GCP)
+
+A production worker is included at `worker/deriverseGlobalWorker.ts`.
+
+Run locally:
+
+```bash
+npm run worker:deriverse
+```
+
+Deployment/service templates:
+
+- `worker/README.md`
+- `worker/systemd/deriverse-global-worker.service`
+
+This worker:
+
+- listens globally to Deriverse devnet program logs,
+- matches only active Deriverse wallets from Supabase,
+- stores matched raw/link rows,
+- materializes grouped trades + executions + funding in DB,
+- keeps `trades.trade_id` in deterministic 5-char uppercase format.
